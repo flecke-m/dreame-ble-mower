@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.venv/
+
+# Reverse Engineering / Forensics (Keep out of the HACS push!)
+analysis/
+inputs/
+dreame-mower-ble/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
