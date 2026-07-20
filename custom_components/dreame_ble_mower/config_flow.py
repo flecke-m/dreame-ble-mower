@@ -32,7 +32,32 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(config_entry):
         return DreameOptionsFlowHandler(config_entry)
 
+    async def _verify_and_create(self, mac: str) -> ConfigFlowResult:
+        """Verify BLE connectivity and create the config entry."""
+        await self.async_set_unique_id(mac)
+        self._abort_if_unique_id_configured({CONF_MAC: mac})
+
+        from bleak import BleakClient
+        try:
+            async with BleakClient(mac, timeout=15.0) as client:
+                if len(client.services) > 0:
+                    _LOGGER.info("Successfully verified BLE connection to %s", mac)
+                    return self.async_create_entry(title="Dreame Mower", data={CONF_MAC: mac})
+        except Exception as err:
+            _LOGGER.warning("BLE verification failed for %s: %s", mac, err)
+
+        return None  # caller handles the error UI
+
     async def async_step_bluetooth(self, user_input) -> ConfigFlowResult:
+        # --- Process form submission ---
+        if user_input is not None:
+            mac = user_input.get(CONF_MAC)
+            result = await self._verify_and_create(mac)
+            if result is not None:
+                return result
+            # Verification failed — fall through to re-show with error
+
+        # --- Build discovery form ---
         auto_match = []
         discovered_dreame = {}
 
@@ -41,39 +66,37 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
                 auto_match.append(disc.address)
                 discovered_dreame[disc.name] = disc.address
 
-        data_schema = vol.Schema({})
         if not auto_match:
-            # No Dreame mowers discovered in Bluetooth LE yet. Ask user for MAC.
-            return self.async_show_form(
-                step_id="user",
-                data_schema=vol.Schema({vol.Required(CONF_MAC): str}),
-                errors={},
-                description_placeholders={}
-            )
+            _LOGGER.warning("No Dreame devices. Ask user for MAC.")
+            return await self.async_step_user()
+
+        data_schema = vol.Schema({vol.Optional(CONF_MAC, default=auto_match[0]): vol.In(discovered_dreame)})
 
         return self.async_show_form(
             step_id="bluetooth",
-            data_schema=vol.Schema({vol.Optional(CONF_MAC, default=auto_match[0]): vol.In(discovered_dreame)}),
+            data_schema=data_schema,
+            errors={"base": "cannot_connect"} if user_input is not None else {},
         )
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
         if user_input is not None:
-            mac = user_input.get(CONF_MAC)
-            await self.async_set_unique_id(mac)
-            self._abort_if_unique_id_configured({CONF_MAC: mac})
-
-            # Verify connectivity to the mower before adding the entry
-            from bleak import BleakClient
-            try:
-                async with BleakClient(mac) as client:
-                    if await client.is_connected and len(client.services) > 0:
-                        return self.async_create_entry(title="Dreame Mower", data={CONF_MAC: mac})
-            except Exception:
+            mac: str = user_input.get(CONF_MAC) or ""
+            if not mac:
                 return self.async_show_form(
                     step_id="user",
-                    errors={"base": "cannot_connect"},
+                    errors={"base": "invalid_mac"},
                     data_schema=vol.Schema({vol.Required(CONF_MAC): str}),
                 )
+            # Reuse the shared verify-and-create logic
+            result = await self._verify_and_create(mac)
+            if result is not None:
+                return result
+            # Verification failed — re-show with error
+            return self.async_show_form(
+                step_id="user",
+                errors={"base": "cannot_connect"},
+                data_schema=vol.Schema({vol.Required(CONF_MAC): str}),
+            )
 
         return self.async_show_form(step_id="user", data_schema=vol.Schema({vol.Required(CONF_MAC): str}))
 
