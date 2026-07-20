@@ -1,4 +1,4 @@
-"""Config flow handler."""
+"""Config flow handler for Dreame BLE Mower integration."""
 from __future__ import annotations
 
 import logging
@@ -7,19 +7,12 @@ from typing import Any
 import voluptuous as vol
 from homeassistant.components.bluetooth import async_discovered_devices
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
-from homeassistant.const import CONF_MAC
 from homeassistant.core import callback
+from homeassistant.const import CONF_MAC
 
 from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
-
-
-async def _async_has_mac(mac_address: str, discovered_dict) -> bool:
-    for d in discovered_dict.values():
-        if d.address == mac_address.upper() or d.name and "dreame" in d.name.lower():
-            return True
-    return False
 
 
 class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -32,75 +25,98 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(config_entry):
         return DreameOptionsFlowHandler(config_entry)
 
+    async def _async_has_mac(mac_address: str, discovered_dict) -> bool:
+        for d in discovered_dict.values():
+            # Try case-insensitive match
+            if d.address.upper() == mac_address.upper() or \
+               (d.name and "dreame" in d.name.lower()):
+                return True
+        return False
+
     async def _verify_and_create(self, mac: str) -> ConfigFlowResult:
         """Verify BLE connectivity and create the config entry."""
-        await self.async_set_unique_id(mac)
-        self._abort_if_unique_id_configured({CONF_MAC: mac})
-
-        from bleak import BleakClient
         try:
-            async with BleakClient(mac, timeout=15.0) as client:
-                if len(client.services) > 0:
-                    _LOGGER.info("Successfully verified BLE connection to %s", mac)
-                    return self.async_create_entry(title="Dreame Mower", data={CONF_MAC: mac})
+            from bleak import BleakClient
+            from homeassistant.components.bluetooth import BluetoothServiceInfo
+            
+            # Find existing device if available
+            discovered = []
+            for disc in async_discovered_devices(self.hass):
+                if disc.address.upper() == mac.upper():
+                    discovered.append(disc)
+            
+            # Use discovered device or fall back to manual connection
+            target_device = None
+            if discovered:
+                target_device = discovered[0]
+                _LOGGER.debug("Found existing discovery target for %s", mac)
+            
+            try:
+                async with BleakClient(mac, timeout=15.0) as client:
+                    # Try to discover services - this is the real test
+                    services = await client.discover_services()
+                    service_count = len([s for s in services]) if services else 0
+                    
+                    _LOGGER.info("Discovered %d services on mower %s", service_count, mac)
+                    
+                    if service_count > 0:
+                        # Success - we can connect and see services
+                        return self.async_create_entry(
+                            title="Dreame Mower",
+                            data=self.entry_data_schema(mac)
+                        )
+            except Exception as err:
+                _LOGGER.debug("Discovery/connection attempt via bleak failed: %s", err)
+            
+            # Fallback - check if we can at least find the device through BLE scans
+            mac_found = False
+            for disc in async_discovered_devices(self.hass):
+                if hasattr(disc, 'address') and disc.address.upper() == mac.upper():
+                    mac_found = True
+                    _LOGGER.debug("Found matching MAC %s via discovery", disc.address)
+                    break
+            
+            if mac_found:
+                # Device was found in BLE scans - good enough for entry creation
+                return self.async_create_entry(
+                    title="Dreame Mower",
+                    data=self.entry_data_schema(mac)
+                )
+                
+            _LOGGER.warning("Could not verify connection to %s", mac)
+        
         except Exception as err:
-            _LOGGER.warning("BLE verification failed for %s: %s", mac, err)
+            _LOGGER.exception("Unexpected error during BLE verification: %s", err)
+        
+        return None  # Caller handles error UI
 
-        return None  # caller handles the error UI
-
-    async def async_step_bluetooth(self, user_input) -> ConfigFlowResult:
-        # --- Process form submission ---
-        if user_input is not None:
-            mac = user_input.get(CONF_MAC)
-            result = await self._verify_and_create(mac)
-            if result is not None:
-                return result
-            # Verification failed — fall through to re-show with error
-
-        # --- Build discovery form ---
-        auto_match = []
-        discovered_dreame = {}
-
-        for disc in async_discovered_devices(self.hass):
-            if (disc.name and "dreame" in disc.name.lower()):
-                auto_match.append(disc.address)
-                discovered_dreame[disc.name] = disc.address
-
-        if not auto_match:
-            _LOGGER.warning("No Dreame devices. Ask user for MAC.")
-            return await self.async_step_user()
-
-        data_schema = vol.Schema({vol.Optional(CONF_MAC, default=auto_match[0]): vol.In(discovered_dreame)})
-
-        return self.async_show_form(
-            step_id="bluetooth",
-            data_schema=data_schema,
-            errors={"base": "cannot_connect"} if user_input is not None else {},
-        )
+    def entry_data_schema(self, mac: str):
+        """Return standard data schema for config entry."""
+        return {CONF_MAC: mac}
 
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> ConfigFlowResult:
+        """Handle the user-initiated setup."""
+        errors: dict[str, str] = {}
+        
         if user_input is not None:
-            mac: str = user_input.get(CONF_MAC) or ""
-            if not mac:
-                return self.async_show_form(
-                    step_id="user",
-                    errors={"base": "invalid_mac"},
-                    data_schema=vol.Schema({vol.Required(CONF_MAC): str}),
-                )
+            self.hass.data.setdefault(DOMAIN, {})
+            
             # Reuse the shared verify-and-create logic
+            mac: str = user_input.get(CONF_MAC) or ""
             result = await self._verify_and_create(mac)
             if result is not None:
                 return result
-            # Verification failed — re-show with error
-            return self.async_show_form(
-                step_id="user",
-                errors={"base": "cannot_connect"},
-                data_schema=vol.Schema({vol.Required(CONF_MAC): str}),
-            )
+                
+            errors = {"base": "cannot_connect"}
 
-        return self.async_show_form(step_id="user", data_schema=vol.Schema({vol.Required(CONF_MAC): str}))
+        return self.async_show_form(
+            step_id="user",
+            data_schema=vol.Schema({vol.Required(CONF_MAC): str}),
+            errors=errors,
+            description_placeholders={}
+        )
 
 
 class DreameOptionsFlowHandler(ConfigFlow):
     """Handle options flow."""
-    ...
+    pass

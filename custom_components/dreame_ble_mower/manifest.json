@@ -1,12 +1,14 @@
 {
-  "domain": "dreame_ble_mower",
-  "name": "Dreame Mower BLE (Local)",
-  "after_dependencies": ["bluetooth"],
-  "codeowners": [],
+  "bluetooth": [
+    {
+      "service_uuid": "0000fe98-0000-1000-8000-00805f9b34fb"
+    }
+  ],
   "dependencies": ["bluetooth_adapters"],
+  "domain": "dreame_ble_mower",
   "documentation": "https://github.com/matthias/dreame-ble-reverse",
-  "integration_type": "device",
   "iot_class": "local_polling",
+  "name": "Dreame Mower BLE (Local)",
   "requirements": ["bleak>=0.21.1"],
-  "version": "0.1.0"
+  "version": "0.1.1"
 }
