@@ -108,16 +108,16 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
         """Check if we can connect to the mower."""
         LOGGER.debug("Checking connection to %s ...", self.address)
 
-        device = bluetooth.async_ble_device_from_address(
-            self.hass, self.address, connectable=True
-        )
-
-        if not device:
-            LOGGER.error("Mower at address %s not found nearby", self.address)
-            return None
-
         try:
-            async with BleakClient(device.address, timeout=15.0) as client:
+            from bleak_retry_connector import get_device
+
+            # Get backend-aware device with proper BlueZ metadata (with .details)
+            bt_dev = await get_device(self.hass, self.address, adapter=None)
+            if not bt_dev:
+                LOGGER.error("Mower at address %s not found nearby", self.address)
+                return None
+
+            async with BleakClient(bt_dev.address_or_id, timeout=15.0) as client:
                 # Services auto-discovered on connect via HA backend wrapper
                 services = getattr(client, 'services', None)
                 service_count = len(services) if services else 0
@@ -178,12 +178,15 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
                 new_data[CONF_PIN] = reauth_entry.data[CONF_PIN]
 
             try:
-                device = bluetooth.async_ble_device_from_address(
-                    self.hass, self.address, connectable=True
-                )
+                from bleak_retry_connector import get_device
 
-                if device:
-                    async with BleakClient(device.address, timeout=15.0) as client:
+                bt_dev = await get_device(self.hass, self.address, adapter=None)
+
+                if bt_dev:
+                    async with BleakClient(bt_dev.address_or_id, timeout=15.0) as client:
+                        services = getattr(client, 'services', None)
+                        service_count = len(services) if services else 0
+                        LOGGER.info("Re-auth: Mower %s has %d GATT services", self.address, service_count)
                         return self.async_update_reload_and_abort(
                             reauth_entry, data=new_data
                         )
