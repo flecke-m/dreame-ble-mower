@@ -121,8 +121,8 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
             client = await establish_connection(
                 BleakClient,
-                device.address_or_id,
-                f"{self.mower_name or 'Dreame Mower'}-{device.address}",
+                device.address,
+                f"{self.mower_name or 'Dreame Mower'}",
             )
 
             service_count = len(client.services) if client.services else 0
@@ -194,8 +194,8 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
                     client = await establish_connection(
                         BleakClient,
-                        device.address_or_id,
-                        f"{self.mower_name}-{device.address}",
+                        device.address,
+                        f"{self.mower_name}",
                     )
                     await client.disconnect()
                     return self.async_update_reload_and_abort(
