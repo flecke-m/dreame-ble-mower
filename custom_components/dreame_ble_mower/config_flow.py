@@ -117,24 +117,16 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
             return None
 
         try:
-            from bleak_retry_connector import establish_connection
+            async with BleakClient(device.address, timeout=15.0) as client:
+                await client.discover_services()
+                service_count = len(client.services) if client.services else 0
+                LOGGER.info("Mower %s has %d GATT services", self.address, service_count)
 
-            client = await establish_connection(
-                BleakClient,
-                device.address,
-                f"{self.mower_name or 'Dreame Mower'}",
-            )
-
-            service_count = len(client.services) if client.services else 0
-            LOGGER.info("Mower %s has %d GATT services", self.address, service_count)
-
-            await client.disconnect()
-
-            if service_count > 0:
-                return self.async_create_entry(
-                    title=self.mower_name or f"Dreame Mower {self.address[:8]}",
-                    data={CONF_ADDRESS: self.address},
-                )
+                if service_count > 0:
+                    return self.async_create_entry(
+                        title=self.mower_name or f"Dreame Mower {self.address[:8]}",
+                        data={CONF_ADDRESS: self.address},
+                    )
 
         except (TimeoutError, BleakError):
             LOGGER.warning("Failed to connect to mower", exc_info=True)
@@ -190,17 +182,11 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
                 )
 
                 if device:
-                    from bleak_retry_connector import establish_connection
-
-                    client = await establish_connection(
-                        BleakClient,
-                        device.address,
-                        f"{self.mower_name}",
-                    )
-                    await client.disconnect()
-                    return self.async_update_reload_and_abort(
-                        reauth_entry, data=new_data
-                    )
+                    async with BleakClient(device.address, timeout=15.0) as client:
+                        await client.discover_services()
+                        return self.async_update_reload_and_abort(
+                            reauth_entry, data=new_data
+                        )
 
             except (TimeoutError, BleakError):
                 errors["base"] = "cannot_connect"
