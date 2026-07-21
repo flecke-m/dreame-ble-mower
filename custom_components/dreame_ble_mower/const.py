@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
+
 DOMAIN = "dreame_ble_mower"
+LOGGER = logging.getLogger(__name__)
 CONF_MAC_ADDRESS = "mac_address"
 
 # Update frequency for the coordinator (seconds) 
