@@ -4,23 +4,21 @@ from collections.abc import Mapping
 import logging
 from typing import Any, override
 
-from bleak import BleakError, BleakClient
+from bleak import BleakClient
 import voluptuous as vol
 
 from homeassistant.components import bluetooth
 from homeassistant.components.bluetooth import BluetoothServiceInfo
-from homeassistant.config_entries import SOURCE_BLUETOOTH, ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_ADDRESS, CONF_PIN
 
 from .const import DOMAIN, LOGGER
 
-BLUETOOTH_SCHEMA = vol.Schema(
+CONFIG_FLOW_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_ADDRESS): str,
     }
 )
-
-REAUTH_SCHEMA = BLUETOOTH_SCHEMA
 
 
 class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -30,6 +28,7 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
     address: str | None = None
     mower_name: str = ""
+    ble_device: Any | None = None
 
     async def _is_supported(self, discovery_info: BluetoothServiceInfo) -> bool:
         """Check if device is supported by looking at manufacturer data."""
@@ -56,9 +55,9 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
             "address": discovery_info.address,
         }
         self.mower_name = discovery_info.name or f"Dreame Mower {discovery_info.address[:8]}"
-        self.address = discovery_info.address
+        self.ble_device = discovery_info
 
-        await self.async_set_unique_id(self.address)
+        await self.async_set_unique_id(discovery_info.address)
         self._abort_if_unique_id_configured()
 
         return await self.async_step_bluetooth_confirm()
@@ -71,15 +70,29 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            self.address = user_input[CONF_ADDRESS].strip().upper()
-            await self.async_set_unique_id(self.address, raise_on_progress=False)
+            mac_address_clean: str = user_input[CONF_ADDRESS].strip().upper()
+            await self.async_set_unique_id(mac_address_clean, raise_on_progress=False)
             self._abort_if_unique_id_configured()
+
+            device_or_none = bluetooth.async_ble_device_from_address(
+                self.hass, mac_address_clean, connectable=True
+            ) or None
+            if not device_or_none:
+                errors["base"] = "cannot_connect"
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=self.add_suggested_values_to_schema(
+                        CONFIG_FLOW_SCHEMA, user_input
+                    ),
+                    errors=errors,
+                )
+
             return await self.check_mower(user_input)
 
         return self.async_show_form(
             step_id="user",
             data_schema=self.add_suggested_values_to_schema(
-                BLUETOOTH_SCHEMA, user_input
+                CONFIG_FLOW_SCHEMA, user_input
             ),
             errors=errors,
         )
@@ -88,17 +101,16 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Confirm discovery for the detected mower."""
-        assert self.address
+        assert self.ble_device
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            self.address = user_input[CONF_ADDRESS].strip().upper()
             return await self.check_mower(user_input)
 
         return self.async_show_form(
             step_id="bluetooth_confirm",
             data_schema=self.add_suggested_values_to_schema(
-                BLUETOOTH_SCHEMA, user_input
+                CONFIG_FLOW_SCHEMA, user_input
             ),
             description_placeholders={"name": self.mower_name},
             errors=errors,
@@ -106,46 +118,43 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def check_mower(self, _user_input: dict[str, Any]) -> ConfigFlowResult | None:
         """Check if we can connect to the mower."""
-        LOGGER.debug("Checking connection to %s ...", self.address)
+        assert self.ble_device or self.address
+        target_addr: str = self.ble_device.address if self.ble_device else (self.address or "")
 
+        LOGGER.debug("Checking connection to %s ...", target_addr)
         try:
-            from bleak_retry_connector import get_device
-
-            # Get backend-aware device with proper BlueZ metadata (with .details)
-            bt_dev = await get_device(self.hass, self.address, adapter=None)
-            if not bt_dev:
-                LOGGER.error("Mower at address %s not found nearby", self.address)
-                return None
-
-            async with BleakClient(bt_dev.address_or_id, timeout=15.0) as client:
-                # Services auto-discovered on connect via HA backend wrapper
-                services = getattr(client, 'services', None)
-                service_count = len(services) if services else 0
-                LOGGER.info("Mower %s has %d GATT services", self.address, service_count)
-
-                if service_count > 0:
+            async with BleakClient(target_addr, timeout=30.0) as raw_client:
+                # Connect works — probe services (discover auto-populates internally)
+                await raw_client.discover_services()
+                svc_list = getattr(raw_client, 'services', None)
+                if svc_list and len([s for s in svc_list or []]) > 0:
+                    LOGGER.info("Mower %s connected successfully with services.", target_addr)
                     return self.async_create_entry(
-                        title=self.mower_name or f"Dreame Mower {self.address[:8]}",
-                        data={CONF_ADDRESS: self.address},
+                        title=self.mower_name or f"Dreame Mower {target_addr[:8]}",
+                        data={CONF_ADDRESS: target_addr},
                     )
 
-        except (TimeoutError, BleakError):
+        except Exception as err:
             LOGGER.warning("Failed to connect to mower", exc_info=True)
-        except Exception:
-            LOGGER.exception("Unexpected error during connection check")
+            if not _user_input:
+                return None
 
-        # If we failed here and there's already an entry, try re-auth path instead
-        if self.context.get("source") == SOURCE_BLUETOOTH:
-            return self.async_abort(reason="cannot_connect")
+        # Fallback — show form again with error if it was a real failure
+        errors_dict: dict[str, str] = {}
+        if self.context.get("source") == "bluetooth_confirm":
+            errors_dict["base"] = "cannot_connect"
+            return self.async_show_form(
+                step_id="bluetooth_confirm",
+                data_schema=self.add_suggested_values_to_schema(CONFIG_FLOW_SCHEMA, _user_input),
+                description_placeholders={"name": self.mower_name},
+                errors=errors_dict,
+            )
 
-        errors = {"base": "cannot_connect"}
-        user_input_to_revert = _user_input or {}
+        errors_dict["base"] = "cannot_connect"
         return self.async_show_form(
             step_id="user",
-            data_schema=self.add_suggested_values_to_schema(
-                BLUETOOTH_SCHEMA, user_input_to_revert
-            ),
-            errors=errors,
+            data_schema=self.add_suggested_values_to_schema(CONFIG_FLOW_SCHEMA, _user_input or {}),
+            errors=errors_dict,
         )
 
     async def async_step_reauth(
@@ -153,14 +162,11 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Perform reauthentication upon an API authentication error."""
         reauth_entry = self._get_reauth_entry()
+        target_addr = entry_data.get(CONF_ADDRESS) or (self.address or "")
 
-        reauth_address = entry_data.get(CONF_ADDRESS) or (self.address or "")
-
-        self.address = reauth_address
-        self.mower_name = reauth_entry.title
         self.context["title_placeholders"] = {
-            "name": self.mower_name,
-            "address": reauth_address,
+            "name": reauth_entry.title,
+            "address": target_addr,
         }
         return await self.async_step_reauth_confirm()
 
@@ -169,39 +175,40 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Confirm reauthentication dialog."""
         errors: dict[str, str] = {}
+        assert self.ble_device or self.address
+        target_addr_clean = (
+            self.address if self.address
+            else (self.ble_device.address if self.ble_device else "")
+        )
 
-        if user_input is not None:
-            reauth_entry = self._get_reauth_entry()
-
-            new_data = {CONF_ADDRESS: self.address}
-            if reauth_entry.data.get(CONF_PIN):
-                new_data[CONF_PIN] = reauth_entry.data[CONF_PIN]
-
-            try:
-                from bleak_retry_connector import get_device
-
-                bt_dev = await get_device(self.hass, self.address, adapter=None)
-
-                if bt_dev:
-                    async with BleakClient(bt_dev.address_or_id, timeout=15.0) as client:
-                        services = getattr(client, 'services', None)
-                        service_count = len(services) if services else 0
-                        LOGGER.info("Re-auth: Mower %s has %d GATT services", self.address, service_count)
-                        return self.async_update_reload_and_abort(
-                            reauth_entry, data=new_data
-                        )
-
-            except (TimeoutError, BleakError):
+        new_payload: dict[str, Any] = {CONF_ADDRESS: target_addr_clean}
+        orig_entry = self._get_reauth_entry()
+        try:
+            dev_check = bluetooth.async_ble_device_from_address(
+                self.hass, target_addr_clean, connectable=True
+            )
+            if not dev_check:
                 errors["base"] = "cannot_connect"
-            except Exception:
-                LOGGER.exception("Unexpected error during re-auth check")
-                errors["base"] = "unknown"
+                raise ValueError("Mower offline")
+
+            async with BleakClient(dev_check.address, timeout=30.0) as direct_conn:
+                await direct_conn.discover_services()
+                services_list = getattr(direct_conn, 'services', None) or []
+                count = len([x for x in services_list])
+                LOGGER.info("Re-auth: Mower %s has %d GATT services", target_addr_clean, count)
+
+            return self.async_update_reload_and_abort(
+                orig_entry, data=new_payload
+            )
+
+        except ValueError:
+            pass
+        except Exception:
+            errors["base"] = "unknown"
 
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=self.add_suggested_values_to_schema(
-                REAUTH_SCHEMA, user_input
-            ),
-            description_placeholders={"name": self.mower_name},
+            data_schema=self.add_suggested_values_to_schema(CONFIG_FLOW_SCHEMA, user_input),
+            description_placeholders={"name": orig_entry.title},
             errors=errors,
         )
