@@ -118,8 +118,9 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
         try:
             async with BleakClient(device.address, timeout=15.0) as client:
-                await client.discover_services()
-                service_count = len(client.services) if client.services else 0
+                # Services auto-discovered on connect via HA backend wrapper
+                services = getattr(client, 'services', None)
+                service_count = len(services) if services else 0
                 LOGGER.info("Mower %s has %d GATT services", self.address, service_count)
 
                 if service_count > 0:
@@ -183,7 +184,6 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
                 if device:
                     async with BleakClient(device.address, timeout=15.0) as client:
-                        await client.discover_services()
                         return self.async_update_reload_and_abort(
                             reauth_entry, data=new_data
                         )
