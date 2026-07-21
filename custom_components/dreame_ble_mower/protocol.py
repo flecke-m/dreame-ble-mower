@@ -12,7 +12,7 @@ import logging
 import struct
 from typing import Any, Callable, Dict, Optional
 
-from bleak import BleakClient, BleakGATTCharacteristicUUID
+from bleak import BleakClient, BleakError
 
 BLUEZ_AVAILABLE = True
 try:
@@ -21,14 +21,7 @@ try:
     )
 except ImportError:
     BLUEZ_AVAILABLE = False
-    # Fallback type for Windows/macOS GATTIO backend
-    BlueZGATTCharType = None
-else:
-    BlueZGATTCharType = BleakGATTCharacteristicBluetoothDBus
-
-def write_bluez_direct(client: BleakClient, handle: int, data: bytes) -> None:
-    """Write directly to a GATT characteristic via BlueZ if possible."""
-    pass  # Placeholder — actual write path goes through bleak_retry_connector
+    BleakGATTCharacteristicBluetoothDBus = None
 
 _LOGGER = logging.getLogger(__name__)
 
