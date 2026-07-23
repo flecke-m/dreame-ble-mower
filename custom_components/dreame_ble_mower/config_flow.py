@@ -87,6 +87,11 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
                     errors=errors,
                 )
 
+            # Populate address + name so check_mower() has them (user path doesn't
+            # go through async_step_bluetooth which sets ble_device)
+            self.address = mac_address_clean
+            self.mower_name = f"Dreame Mower {mac_address_clean[:8]}"
+
             return await self.check_mower(user_input)
 
         return self.async_show_form(
@@ -141,7 +146,7 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
         # Fallback — show form again with error if it was a real failure
         errors_dict: dict[str, str] = {}
-        if self.context.get("source") == "bluetooth_confirm":
+        if self.context.get("source") == "bluetooth":
             errors_dict["base"] = "cannot_connect"
             return self.async_show_form(
                 step_id="bluetooth_confirm",
