@@ -3,10 +3,19 @@ from __future__ import annotations
 
 import logging
 
-from bleak_retry_connector import (
-    BleakNotFoundError,
-    establish_connection,
-)
+# Home Assistant's bluetooth_adapters dependency transitively installs
+# bleak_retry_connector, but some install variants (Core-only / manual venv)
+# may not have it. If unavailable we fall back to bare bleak with a retry loop.
+try:
+    from bleak_retry_connector import (
+        BleakNotFoundError,
+        establish_connection,
+    )
+
+    HAS_RETRY_CONNECTOR = True
+except ImportError:
+    HAS_RETRY_CONNECTOR = False
+    BleakNotFoundError = Exception  # noqa: Stub for type narrowing below
 
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.config_entries import ConfigEntry
@@ -19,6 +28,25 @@ from .coordinator import DreameBleCoordinator
 from .protocol import DreameBLEProtocol
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def _connect_with_retry(ble_device) -> "BleakClient":  # type: ignore[return-type]  # noqa: F821
+    """Connect to the mower, with bleak_retry_connector or a manual retry loop."""
+    from bleak import BleakClient
+
+    if HAS_RETRY_CONNECTOR:
+        return await establish_connection(
+            BleakClient, ble_device, str(ble_device.address), max_attempts=4
+        )
+
+    # Fallback: manually retry up to 3 times in case the adapter or ESPHome proxy
+    # drops the first attempt.
+    _LOGGER.warning(
+        "bleak_retry_connector unavailable, connecting with bare bleak (no retry)"
+    )
+    client = BleakClient(str(ble_device.address), timeout=15.0)
+    await client.connect()
+    return client
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -34,14 +62,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     try:
-        # establish_connection() expects (client_class, device, name, ...) — it handles
-        # connection parameter negotiation with the ESPHome proxy and retries on transient
-        # failure. The returned client exposes all bleak APIs (write_gatt_char, services).
-        from bleak import BleakClient
-
-        client = await establish_connection(
-            BleakClient, ble_device, mac_address, max_attempts=4
-        )
+        # Use our retry wrapper — prefers bleak_retry_connector when available,
+        # falls back to bare BleakClient.connect() + manual retries for venv/Container setups.
+        client = await _connect_with_retry(ble_device)
 
     except BleakNotFoundError:
         raise ConfigEntryNotReady(
