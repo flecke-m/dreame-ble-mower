@@ -3,9 +3,16 @@ from __future__ import annotations
 
 import logging
 
+from bleak_retry_connector import (
+    BleakNotFoundError,
+    establish_connection,
+)
+
+from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryNotReady
 
 from .const import DOMAIN, PLATFORMS
 from .coordinator import DreameBleCoordinator
@@ -19,47 +26,46 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     mac_address = entry.data[CONF_ADDRESS]
     _LOGGER.info("Setting up local BLE connection for %s", mac_address)
 
-    client = None
-    had_error = False
+    # Get the nearest adapter that can reach the device via HA's bluetooth manager.
+    ble_device = async_ble_device_from_address(hass, mac_address, connectable=True)
+    if not ble_device:
+        raise ConfigEntryNotReady(
+            f"Dreame Mower at {mac_address} not found by any connected BLE adapter"
+        )
 
     try:
+        # establish_connection() expects (client_class, device, name, ...) — it handles
+        # connection parameter negotiation with the ESPHome proxy and retries on transient
+        # failure. The returned client exposes all bleak APIs (write_gatt_char, services).
         from bleak import BleakClient
 
-        # Create client outside context manager so it survives beyond setup.
-        client = BleakClient(mac_address, timeout=15.0)
-        await client.connect()
+        client = await establish_connection(
+            BleakClient, ble_device, mac_address, max_attempts=4
+        )
 
-        if not await client.is_connected:
-            raise ConnectionError(
-                f"Bleak reported connect success but is_connected=False for {mac_address}"
-            )
-
-        _LOGGER.info("BLE connection established, discovered %d services", len(client.services))
-
-        protocol = DreameBLEProtocol(client)
-        coordinator = DreameBleCoordinator(hass, protocol)
-        await coordinator.async_config_entry_first_refresh()
-
-        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-            "coordinator": coordinator,
-            "client": client,
-        }
-
-        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-        return True
-
+    except BleakNotFoundError:
+        raise ConfigEntryNotReady(
+            f"Dreame Mower at {mac_address} disappeared from BLE scan results"
+        )
     except Exception as err:
-        _LOGGER.error("Could not connect to Dreame mower at %s: %s", mac_address, err)
-        had_error = True
-        raise
+        # Catch-all for BLEError, connection failures, timeouts, etc.
+        raise ConfigEntryNotReady(
+            f"Failed to connect to Dreame Mower at {mac_address}: {err}"
+        ) from err
 
-    finally:
-        # Only disconnect on the error path so a working client persists.
-        if had_error and client is not None:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
+    _LOGGER.info("BLE connection established")
+
+    protocol = DreameBLEProtocol(client)
+    coordinator = DreameBleCoordinator(hass, protocol)
+    await coordinator.async_config_entry_first_refresh()
+
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
+        "coordinator": coordinator,
+        "client": client,
+    }
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
