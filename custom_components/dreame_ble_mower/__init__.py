@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_MAC
+from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, PLATFORMS
@@ -16,10 +16,11 @@ _LOGGER = logging.getLogger(__name__)
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Dreame Mower BLE from a config entry."""
-    _LOGGER.info("Setting up local BLE connection for %s", entry.data[CONF_MAC])
+    mac_address = entry.data[CONF_ADDRESS]
+    _LOGGER.info("Setting up local BLE connection for %s", mac_address)
 
-    mac_address = entry.data[CONF_MAC]
     client = None
+    had_error = False
 
     try:
         from bleak import BleakClient
@@ -49,11 +50,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     except Exception as err:
         _LOGGER.error("Could not connect to Dreame mower at %s: %s", mac_address, err)
+        had_error = True
         raise
 
     finally:
-        # If we got here via the exception path and client exists, tear it down.
-        if "err" in dir() and client is not None:
+        # Only disconnect on the error path so a working client persists.
+        if had_error and client is not None:
             try:
                 await client.disconnect()
             except Exception:
@@ -73,7 +75,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 if await client.is_connected:
                     await client.disconnect()
                 _LOGGER.info(
-                    "BLE client disconnected on unload for %s", entry.data[CONF_MAC]
+                    "BLE client disconnected on unload for %s", entry.data[CONF_ADDRESS]
                 )
             except Exception as err:
                 _LOGGER.warning("Error disconnecting BLE client on unload: %s", err)

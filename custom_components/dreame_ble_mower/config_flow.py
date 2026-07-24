@@ -30,15 +30,36 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
     ble_device: Any | None = None
 
     async def _is_supported(self, discovery_info: BluetoothServiceInfo) -> bool:
-        """Check if device is supported by looking at manufacturer data."""
+        """Check if discovered device looks like a Dreame/MOVA mower.
+
+        The manifest already filters on service_uuid=0xfee9 + connectable=true, but this
+        extra gate reduces false positives from Nordic-chip devices that happen to match.
+        Dreame is not a Bluetooth SIG member (Eco-Ware has no company ID), so we cannot
+        filter by manufacturer_data — accept the device if its name hints at a mower or
+        it carries any advertisement payload worth acting on.
+        """
         LOGGER.debug("Checking if device is supported: %s", discovery_info)
-        if not any(d for d in discovery_info.manufacturer_data.values()):
-            LOGGER.debug(
-                "No manufacturer data present, skipping: %s",
-                discovery_info.name,
-            )
-            return False
-        return True
+
+        # Devices that advertise a Dreame/MOVA name are almost certainly ours
+        name_lower = (discovery_info.name or "").lower()
+        if name_lower and any(kw in name_lower for kw in ("dreame", "mova")):
+            return True
+
+        # Also accept devices with manufacturer data or service data — these carry
+        # enough fingerprint to be worth adding. A bare connectable Nordic chip is unlikely.
+        if discovery_info.manufacturer_data and any(
+            discovery_info.manufacturer_data.values()
+        ):
+            return True
+
+        if discovery_info.service_data:
+            return True
+
+        LOGGER.debug(
+            "Service UUID matched but no identifying data, skipping: %s",
+            discovery_info.name,
+        )
+        return False
 
     @override
     async def async_step_bluetooth(
