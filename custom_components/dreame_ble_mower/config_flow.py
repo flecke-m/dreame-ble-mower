@@ -4,7 +4,6 @@ from collections.abc import Mapping
 import logging
 from typing import Any, override
 
-from bleak import BleakClient
 import voluptuous as vol
 
 from homeassistant.components import bluetooth
@@ -123,43 +122,18 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def check_mower(self, _user_input: dict[str, Any]) -> ConfigFlowResult | None:
         """Check if we can connect to the mower."""
+        # Device reachability was already verified earlier in this flow (bluetooth discovery
+        # or bluetooth.async_ble_device_from_address), so no need for GATT probing here.
+        # Home Assistant wraps BleakClient in HaBleakClientWrapper which lacks
+        # discover_services() and warns about bleak_retry_connector usage — those calls would
+        # always fail/crash the config flow.
         assert self.ble_device or self.address
         target_addr: str = self.ble_device.address if self.ble_device else (self.address or "")
 
-        LOGGER.debug("Checking connection to %s ...", target_addr)
-        try:
-            async with BleakClient(target_addr, timeout=30.0) as raw_client:
-                # Connect works — probe services (discover auto-populates internally)
-                await raw_client.discover_services()
-                svc_list = getattr(raw_client, 'services', None)
-                if svc_list and len([s for s in svc_list or []]) > 0:
-                    LOGGER.info("Mower %s connected successfully with services.", target_addr)
-                    return self.async_create_entry(
-                        title=self.mower_name or f"Dreame Mower {target_addr[:8]}",
-                        data={CONF_ADDRESS: target_addr},
-                    )
-
-        except Exception as err:
-            LOGGER.warning("Failed to connect to mower", exc_info=True)
-            if not _user_input:
-                return None
-
-        # Fallback — show form again with error if it was a real failure
-        errors_dict: dict[str, str] = {}
-        if self.context.get("source") == "bluetooth":
-            errors_dict["base"] = "cannot_connect"
-            return self.async_show_form(
-                step_id="bluetooth_confirm",
-                data_schema=self.add_suggested_values_to_schema(CONFIG_FLOW_SCHEMA, _user_input),
-                description_placeholders={"name": self.mower_name},
-                errors=errors_dict,
-            )
-
-        errors_dict["base"] = "cannot_connect"
-        return self.async_show_form(
-            step_id="user",
-            data_schema=self.add_suggested_values_to_schema(CONFIG_FLOW_SCHEMA, _user_input or {}),
-            errors=errors_dict,
+        LOGGER.debug("Mower %s verified reachable, creating entry", target_addr)
+        return self.async_create_entry(
+            title=self.mower_name or f"Dreame Mower {target_addr[:8]}",
+            data={CONF_ADDRESS: target_addr},
         )
 
     async def async_step_reauth(
@@ -180,14 +154,22 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         """Confirm reauthentication dialog."""
         errors: dict[str, str] = {}
-        assert self.ble_device or self.address
-        target_addr_clean = (
-            self.address if self.address
-            else (self.ble_device.address if self.ble_device else "")
-        )
 
-        new_payload: dict[str, Any] = {CONF_ADDRESS: target_addr_clean}
-        orig_entry = self._get_reauth_entry()
+        if user_input is not None:
+            target_addr_clean: str = user_input.get(CONF_ADDRESS, "").strip().upper()
+        else:
+            orig_entry_reauth = self._get_reauth_entry()
+            target_addr_clean = (orig_entry_reauth.data.get(CONF_ADDRESS) or "").strip().upper()
+
+        if not target_addr_clean:
+            errors["base"] = "cannot_connect"
+            return self.async_show_form(
+                step_id="reauth_confirm",
+                data_schema=self.add_suggested_values_to_schema(CONFIG_FLOW_SCHEMA, user_input),
+                description_placeholders={"name": self.context.get("title_placeholders", {}).get("name", "Mower")},
+                errors=errors,
+            )
+
         try:
             dev_check = bluetooth.async_ble_device_from_address(
                 self.hass, target_addr_clean, connectable=True
@@ -196,14 +178,15 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "cannot_connect"
                 raise ValueError("Mower offline")
 
-            async with BleakClient(dev_check.address, timeout=30.0) as direct_conn:
-                await direct_conn.discover_services()
-                services_list = getattr(direct_conn, 'services', None) or []
-                count = len([x for x in services_list])
-                LOGGER.info("Re-auth: Mower %s has %d GATT services", target_addr_clean, count)
+            # Device is reachable — no need for GATT probing in config flow.
+            # Home Assistant's BLE layer wraps BleakClient in HaBleakClientWrapper which
+            # lacks discover_services(). GATT connectivity will be validated by the
+            # coordinator on successful setup.
+            LOGGER.info("Re-auth: Mower at %s verified reachable", target_addr_clean)
 
             return self.async_update_reload_and_abort(
-                orig_entry, data=new_payload
+                self._get_reauth_entry(),
+                data={CONF_ADDRESS: target_addr_clean},
             )
 
         except ValueError:
@@ -211,9 +194,14 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
         except Exception:
             errors["base"] = "unknown"
 
+        reauth_placeholder_name = (
+            self.context.get("title_placeholders", {}).get(
+                "name", "Mower"
+            )
+        )
         return self.async_show_form(
             step_id="reauth_confirm",
             data_schema=self.add_suggested_values_to_schema(CONFIG_FLOW_SCHEMA, user_input),
-            description_placeholders={"name": orig_entry.title},
+            description_placeholders={"name": reauth_placeholder_name},
             errors=errors,
         )
