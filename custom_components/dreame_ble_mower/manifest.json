@@ -5,12 +5,16 @@
       "service_uuid": "0000fee9-0000-1000-8000-00805f9b34fb"
     }
   ],
+  "codeowners": ["@flecke-m"],
   "config_flow": true,
   "dependencies": ["bluetooth_adapters"],
   "domain": "dreame_ble_mower",
-  "documentation": "https://github.com/matthias/dreame-ble-reverse",
+  "documentation": "https://github.com/flecke-m/dreame-ble-mower",
   "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/flecke-m/dreame-ble-mower/issues",
+  "loggers": ["custom_components.dreame_ble_mower"],
   "name": "Dreame Mower BLE (Local)",
   "requirements": ["bleak>=0.21.1"],
-  "version": "0.1.2"
+  "service_icon": "mdi:lawn-mower",
+  "version": "0.1.3"
 }

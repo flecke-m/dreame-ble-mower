@@ -8,7 +8,11 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, SCAN_INTERVAL_SEC
-from .protocol import DreameBLEProtocol
+from .protocol import (
+    DREAME_HANDLE_COMMANDS_TASKS,
+    DREAME_HANDLE_DEVICE_STATUS,
+    DreameBLEProtocol,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,11 +40,15 @@ class DreameBleCoordinator(DataUpdateCoordinator):
     async def _async_update_data(self):
         """Poll the mower for current state and update our dict."""
         try:
-            # Request Battery State (CFG) via GATT handle 0x0020 -> 'BAT' key
-            battery_resp = await self._protocol.read_status("0020", "CFG")
-            
-            # Request Task Status via GATT handle 0x001d -> 'TASK' key
-            task_resp = await self._protocol.read_status("001d", "TASK")
+            # Request Battery State (CFG) via device-status handle -> 'BAT' key
+            battery_resp = await self._protocol.read_status(
+                DREAME_HANDLE_DEVICE_STATUS, "CFG"
+            )
+
+            # Request Task Status via commands handle -> 'TASK' key
+            task_resp = await self._protocol.read_status(
+                DREAME_HANDLE_COMMANDS_TASKS, "TASK"
+            )
 
             return self._parse_responses(battery_resp, task_resp)
         except Exception as ex:

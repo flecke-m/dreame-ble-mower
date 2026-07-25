@@ -1,5 +1,6 @@
 {
-    "name": "Dreame BLE Mower",
-    "render_readme": true,
-    "hide_download": false
+  "name": "Dreame BLE Mower",
+  "render_readme": true,
+  "hide_download": false,
+  "homeassistant": "2024.8.0"
 }

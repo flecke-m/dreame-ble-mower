@@ -79,6 +79,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.info("BLE connection established")
 
     protocol = DreameBLEProtocol(client)
+
+    # Subscribe to mower push notifications BEFORE the first refresh so
+    # incoming responses are routed to pending futures.
+    await protocol.start_notifications()
+
     coordinator = DreameBleCoordinator(hass, protocol)
     await coordinator.async_config_entry_first_refresh()
 
