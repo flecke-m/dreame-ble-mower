@@ -97,7 +97,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if coordinator:
         client = coordinator._protocol._client
         try:
-            if await client.is_connected:
+            if client.is_connected:
                 await client.disconnect()
             _LOGGER.info(
                 "BLE client disconnected on unload for %s", entry.data[CONF_ADDRESS]
