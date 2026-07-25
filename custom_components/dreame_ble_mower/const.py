@@ -12,7 +12,7 @@ CONF_MAC_ADDRESS = "mac_address"
 SCAN_INTERVAL_SEC = 15
 
 # Platforms this integration provides
-PLATFORMS: list[str] = ["lawn_mower", "sensor", "binary_sensor"]
+PLATFORMS: list[str] = ["lawn_mower", "sensor"]
 
 # Standard entity registries mapped to our discovered JSON keys.
 ATTR_BATTERY_PERCENT = "battery_percent"

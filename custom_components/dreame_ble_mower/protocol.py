@@ -25,11 +25,11 @@ except ImportError:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Dreame Mower GATT Characteristic Handles (reversed from our analysis)
-DREAME_HANDLE_COMMANDS_TASKS = "0x001d"  # Start mowing, park, return to base
-DREAME_HANDLE_MPOS_POSITIONING = "0x0029" # Map GPS / Mower positioning state
-DREAME_HANDLE_DEVICE_STATUS    = "0x0023" # Timezone sync, general status/config queries
-DREAME_HANDLE_NOTIFICATIONS    = "0x0017" # Push notifications from mower (status/battery/events)
+# Dreame Mower GATT Characteristic Handles (bare hex, no 0x prefix — bleak requires it)
+DREAME_HANDLE_COMMANDS_TASKS = "001d"  # Start mowing, park, return to base
+DREAME_HANDLE_MPOS_POSITIONING = "0029" # Map GPS / Mower positioning state
+DREAME_HANDLE_DEVICE_STATUS    = "0023" # Timezone sync, general status/config queries
+DREAME_HANDLE_NOTIFICATIONS    = "0017" # Push notifications from mower (status/battery/events)
 
 # BLE Opcodes discovered in PCAPs:
 OP_START_MOWING   = 207
