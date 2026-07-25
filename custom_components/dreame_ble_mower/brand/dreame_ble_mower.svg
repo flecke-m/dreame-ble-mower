@@ -1,0 +1,19 @@
+<!-- Brand icon for Dreame Mower BLE Home Assistant integration -->
+<!-- Uses currentColor so it adapts to dark/light themes -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">
+  <style>
+    body{fill:currentColor}
+    .wheels{stroke:currentColor;stroke-width:2.5;fill:none}
+    .handle{stroke:currentColor;stroke-width:2.5;stroke-linecap:round}
+    .deck{fill:currentColor}
+  </style>
+  <!-- Lawn mower deck -->
+  <rect class="deck" x="8" y="16" width="30" height="14" rx="3"/>
+  <!-- Rear wheel (bigger) -->
+  <circle class="wheels" cx="15" cy="34" r="5"/>
+  <!-- Front wheel (smaller) -->
+  <circle class="wheels" cx="30" cy="34" r="4"/>
+  <!-- Handle bar -->
+  <line class="handle" x1="38" y1="16" x2="44" y2="10"/>
+  <line class="handle" x1="44" y1="10" x2="44" y2="4"/>
+</svg>

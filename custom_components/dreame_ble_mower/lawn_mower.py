@@ -27,6 +27,8 @@ async def async_setup_entry(
 class DreameMower(DreameMowerEntity, LawnMowerEntity):
     """Representation of a local BLE-connected Dreame Mower."""
 
+    _attr_icon = "mdi:lawn-mower"
+
     def __init__(self, coordinator: DreameBleCoordinator) -> None:
         super().__init__(coordinator, "lawn_mower")
         self._attr_name = "Dreame Mower"
