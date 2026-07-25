@@ -37,10 +37,10 @@ class DreameBleCoordinator(DataUpdateCoordinator):
         """Poll the mower for current state and update our dict."""
         try:
             # Request Battery State (CFG) via GATT handle 0x0020 -> 'BAT' key
-            battery_resp = await self._protocol.read_status("0x0020", "CFG")
+            battery_resp = await self._protocol.read_status("0020", "CFG")
             
             # Request Task Status via GATT handle 0x001d -> 'TASK' key
-            task_resp = await self._protocol.read_status("0x001d", "TASK")
+            task_resp = await self._protocol.read_status("001d", "TASK")
 
             return self._parse_responses(battery_resp, task_resp)
         except Exception as ex:

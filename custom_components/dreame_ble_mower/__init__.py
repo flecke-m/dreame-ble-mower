@@ -82,10 +82,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     coordinator = DreameBleCoordinator(hass, protocol)
     await coordinator.async_config_entry_first_refresh()
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
-        "coordinator": coordinator,
-        "client": client,
-    }
+    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
@@ -93,20 +90,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload all platforms and disconnect BLE client."""
-    data = hass.data[DOMAIN].pop(entry.entry_id, None)
+    coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
-    if data:
-        client = data.get("client")
-        if client is not None:
-            try:
-                if await client.is_connected:
-                    await client.disconnect()
-                _LOGGER.info(
-                    "BLE client disconnected on unload for %s", entry.data[CONF_ADDRESS]
-                )
-            except Exception as err:
-                _LOGGER.warning("Error disconnecting BLE client on unload: %s", err)
+    if coordinator:
+        client = coordinator._protocol._client
+        try:
+            if await client.is_connected:
+                await client.disconnect()
+            _LOGGER.info(
+                "BLE client disconnected on unload for %s", entry.data[CONF_ADDRESS]
+            )
+        except Exception as err:
+            _LOGGER.warning("Error disconnecting BLE client on unload: %s", err)
 
     return unload_ok
