@@ -58,24 +58,53 @@ class DreameBLEProtocol:
 
     @staticmethod
     def wrap(json_data: dict) -> bytes:
-        """Encode a dictionary into the Dreame C0 envelope binary frame."""
+        """Encode a dictionary into the Dreame C0 envelope binary frame.
+
+        Layout: 0xC0 0xFF [len_hi] [len_lo] json_utf8_bytes 0xC0
+        Total header = 4 bytes, trailer = 1 byte.
+        """
         json_bytes = json.dumps(json_data).encode("utf-8")
         length_bytes = struct.pack(">H", len(json_bytes))
         return b"\xC0\xFF" + length_bytes + json_bytes + b"\xC0"
 
     @staticmethod
     def unwrap(raw_bytes: bytes) -> Optional[Dict[str, Any]]:
-        """Decode a C0 envelope back into its JSON dictionary."""
-        try:
-            if raw_bytes[0] != 0xC0 or raw_bytes[-1] != 0xC0 or len(raw_bytes) < 4:
-                _LOGGER.warning("Invalid Dreame BLE C0 envelope (missing header/footer)")
-                return None
+        """Decode a C0 envelope back into its JSON dictionary.
 
-            json_text = raw_bytes[3:-1].decode("utf-8", errors="ignore")
-            return json.loads(json_text)
-        except Exception as ex:
-            _LOGGER.error("Failed to decode/unwrap BLE data: %s", ex)
-            return None
+        Tries multiple formats because the mower sends different payload types:
+        1. C0 envelope (C0 FF len_hi len_lo json C0 — 4-byte header)
+        2. Bare JSON (plain UTF-8 without any wrapper)
+        """
+        # --- Format 1: C0 envelope ---
+        if (len(raw_bytes) >= 6 and
+                raw_bytes[0] == 0xC0 and
+                raw_bytes[-1] == 0xC0):
+            try:
+                # 4-byte header: 0xC0 0xFF len_hi len_lo
+                json_text = raw_bytes[4:-1].decode("utf-8", errors="ignore")
+                return json.loads(json_text)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+
+        # --- Format 2: Bare JSON (no C0 wrapper) ---
+        try:
+            json_text = raw_bytes.decode("utf-8", errors="ignore").strip()
+            data = json.loads(json_text)
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            pass
+
+        # --- Debug dump for unknown formats ---
+        _LOGGER.debug(
+            "Unable to decode notification payload (%d bytes), "
+            "first_byte=0x%02x, last_byte=0x%02x: %s",
+            len(raw_bytes),
+            raw_bytes[0] if raw_bytes else 0,
+            raw_bytes[-1] if raw_bytes else 0,
+            raw_bytes[:80].hex(),
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Notification subscription
@@ -98,13 +127,12 @@ class DreameBLEProtocol:
         """Handle incoming notification from the mower."""
         parsed = self.unwrap(bytes(data))
         if parsed is None:
-            _LOGGER.debug("Raw notification dropped (unwrap failed): %s", bytes(data).hex())
-            return
+            return  # Already logged in unwrap()
 
         q_id = parsed.get("q")
         msg_type = parsed.get("m")
         _LOGGER.debug(
-            "Notification received — handle=0x%04x, q=%s, m=%s, payload=%s",
+            "Notification — handle=0x%04x, q=%s, m=%s: %s",
             handle,
             q_id,
             msg_type,
@@ -163,9 +191,8 @@ class DreameBLEProtocol:
                 _LOGGER.debug("Got matched response for q=%d", q_id)
                 return response
             except asyncio.TimeoutError:
-                _LOGGER.warning(
-                    "Timeout waiting %ds for response to q=%d — mower may not reply to this type of request",
-                    REQUEST_TIMEOUT_SEC,
+                _LOGGER.debug(
+                    "No synchronous reply to q=%d — mower may use async push instead",
                     q_id,
                 )
                 self._pending.pop(q_id, None)
@@ -179,14 +206,21 @@ class DreameBLEProtocol:
     async def read_status(
         self, handle: int, target_type: str, extra_data: Optional[dict] = None
     ) -> Dict[str, Any]:
-        """Request specific state from the mower (e.g., Battery, Position)."""
+        """Request specific state from the mower (e.g., Battery, Position).
+
+        NOTE: The mower may not send a synchronous response to GET requests.
+        Instead it pushes state updates through the notification handle.
+        This method sends fire-and-forget — actual data arrives via on_status_update.
+        """
         q_id = self.request_id
         payload = {"m": "g", "t": target_type, "q": q_id}
         if extra_data:
             payload["d"] = extra_data
 
-        _LOGGER.debug("Requesting mower state [%s] with Request ID %s", target_type, q_id)
-        return await self.send_command(handle, payload)
+        _LOGGER.debug("Requesting mower state [%s] with Request ID %d (fire-and-forget)", target_type, q_id)
+        # Fire-and-forget — don't block waiting for a matching response
+        await self.send_command(handle, payload, wait_for_response=False)
+        return {}
 
     async def start_mowing(self, zone_idx: int = 0) -> bool:
         """Send command to start mowing."""
@@ -198,22 +232,23 @@ class DreameBLEProtocol:
             "d": {"idx": zone_idx},
             "q": q_id,
         }
-        result = await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd)
         _LOGGER.info("Sent mowing command for zone %d (Q=%d)", zone_idx, q_id)
-        return result is not None
+        # Action commands also fire-and-forget — mower pushes state change asynchronously
+        await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd, wait_for_response=False)
+        return True
 
     async def dock(self) -> bool:
         """Send command to return to docking station."""
         q_id = self.request_id
         cmd = {"m": "a", "p": 0, "o": OP_DOCK_RETURN, "d": {"idx": 0}, "q": q_id}
-        result = await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd)
         _LOGGER.info("Sent dock command (Q=%d)", q_id)
-        return result is not None
+        await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd, wait_for_response=False)
+        return True
 
     async def pause(self) -> bool:
         """Park the mower at its current position."""
         q_id = self.request_id
         cmd = {"m": "a", "p": 0, "o": OP_PARK_AT_POS, "q": q_id}
-        result = await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd)
         _LOGGER.info("Sent pause/park command (Q=%d)", q_id)
-        return result is not None
+        await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd, wait_for_response=False)
+        return True
