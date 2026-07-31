@@ -3,19 +3,10 @@ from __future__ import annotations
 
 import logging
 
-# Home Assistant's bluetooth_adapters dependency transitively installs
-# bleak_retry_connector, but some install variants (Core-only / manual venv)
-# may not have it. If unavailable we fall back to bare bleak with a retry loop.
-try:
-    from bleak_retry_connector import (
-        BleakNotFoundError,
-        establish_connection,
-    )
-
-    HAS_RETRY_CONNECTOR = True
-except ImportError:
-    HAS_RETRY_CONNECTOR = False
-    BleakNotFoundError = Exception  # noqa: Stub for type narrowing below
+# Defer all heavy third-party imports (bleak, bleak_retry_connector) until they
+# are actually needed inside the async setup function. Importing them here would
+# block HA's main event loop during loader.import_module.
+HAS_RETRY_CONNECTOR = None  # Resolved lazily in _resolve_bleak()
 
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.config_entries import ConfigEntry
@@ -30,18 +21,42 @@ from .protocol import DreameBLEProtocol
 _LOGGER = logging.getLogger(__name__)
 
 
-async def _connect_with_pairing(ble_device):  # type: ignore[return-type]  # noqa: F821
+def _resolve_bleak():
+    """Lazily resolve bleak + bleak_retry_connector on first call.
+
+    This avoids blocking HA's event loop at module-load time while still keeping
+    the try/except fallback logic intact.
+    """
+    global HAS_RETRY_CONNECTOR  # noqa: PLW0603
+    if HAS_RETRY_CONNECTOR is None:
+        try:
+            from bleak_retry_connector import BleakNotFoundError, establish_connection
+
+            BleakNotFoundError()  # noqa: B018 – sanity-instantiate to catch broken installs early
+            HAS_RETRY_CONNECTOR = True
+        except ImportError:
+            _LOGGER.warning(
+                "bleak_retry_connector unavailable — falling back to bare bleak with no retry"
+            )
+            HAS_RETRY_CONNECTOR = False
+
+    return BleakNotFoundError, establish_connection
+
+
+async def _connect_with_pairing(ble_device):  # type: ignore[return-type]
     """Connect to the mower, establish pairing/bonding, then return the client."""
     from bleak import BleakClient, BleakError
 
+    if HAS_RETRY_CONNECTOR is None:
+        _resolve_bleak()
+
     if HAS_RETRY_CONNECTOR:
+        _, establish_connection = _resolve_bleak()
         client = await establish_connection(
             BleakClient, ble_device, str(ble_device.address), max_attempts=4
         )
     else:
-        _LOGGER.warning(
-            "bleak_retry_connector unavailable — connecting with bare bleak (no retry)"
-        )
+        _LOGGER.warning("Connecting with bare bleak (no retry)")
         client = BleakClient(str(ble_device.address), timeout=15.0)
         await client.connect()
 
@@ -83,6 +98,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         raise ConfigEntryNotReady(
             f"Dreame Mower at {mac_address} not found by any connected BLE adapter"
         )
+
+    # Resolve bleak (lazy import to avoid blocking HA event loop)
+    BleakNotFoundError, _ = _resolve_bleak()
 
     try:
         client = await _connect_with_pairing(ble_device)
