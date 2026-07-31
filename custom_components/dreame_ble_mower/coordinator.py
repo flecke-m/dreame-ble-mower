@@ -10,11 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import DOMAIN, SCAN_INTERVAL_SEC
-from .protocol import (
-    DREAME_HANDLE_COMMANDS_TASKS,
-    DREAME_HANDLE_DEVICE_STATUS,
-    DreameBLEProtocol,
-)
+from .protocol import DreameBLEProtocol
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -137,12 +133,12 @@ class DreameBleCoordinator(DataUpdateCoordinator):
         try:
             # Fire-and-forget GET for battery/config data
             await self._protocol.read_status(
-                DREAME_HANDLE_DEVICE_STATUS, "CFG"
+                self._protocol.handle_device_status, "CFG"
             )
 
-            # Fire-and-for-get GET for task status
+            # Fire-and-forget GET for task status
             await self._protocol.read_status(
-                DREAME_HANDLE_COMMANDS_TASKS, "TASK"
+                self._protocol.handle_commands_tasks, "TASK"
             )
 
         except Exception as ex:
