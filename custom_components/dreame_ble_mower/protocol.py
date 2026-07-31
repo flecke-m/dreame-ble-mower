@@ -1,11 +1,6 @@
 #!/usr/bin/env python3
-"""
-Dreame Mower Local BLE Protocol Bridge.
-Handles low-level communication over Bluetooth Low Energy using bleak,
-wrapping/unwrapping the C0 payload envelope and tracking the auto-incrementing 'q' request IDs.
-
-Replaces the MQTT/Cloud logic from antondaubert/dreame-mower with real-time local BLE pushes.
-"""
+"""Dreame Mower Local BLE Protocol Bridge."""
+from __future__ import annotations
 
 import asyncio
 import json
@@ -17,18 +12,19 @@ from bleak import BleakClient, BleakError
 
 _LOGGER = logging.getLogger(__name__)
 
-# Dreame Mower GATT handles — these are ATT handle numbers (int), not UUIDs.
-DREAME_HANDLE_COMMANDS_TASKS = 0x001d   # Start mowing, park, return to base
-DREAME_HANDLE_MPOS_POSITIONING = 0x0029 # Map GPS / Mower positioning state
-DREAME_HANDLE_DEVICE_STATUS = 0x0023    # Timezone sync, general status/config queries
-DREAME_HANDLE_NOTIFICATIONS = 0x0017    # Push notifications from mower (status/battery/events)
+# ---------------------------------------------------------------------------
+# Default ATT handles (fallback when GATT discovery doesn't find them).
+# These were captured from your PCAP analysis on your firmware revision.
+# ---------------------------------------------------------------------------
+_DEFAULT_HANDLE_NOTIFICATIONS = 0x0017
+_DEFAULT_HANDLE_COMMANDS_TASKS = 0x001d
+_DEFAULT_HANDLE_DEVICE_STATUS = 0x0023
+_DEFAULT_HANDLE_MPOS_POSITIONING = 0x0029
 
-# BLE Opcodes discovered in PCAPs:
 OP_START_MOWING = 207
 OP_PARK_AT_POS = 202
 OP_DOCK_RETURN = 200
 OP_RESUME_CONTROL = 5
-
 REQUEST_TIMEOUT_SEC = 5.0
 
 
@@ -37,13 +33,23 @@ class DreameBLEProtocol:
 
     def __init__(self, client: BleakClient):
         self._client = client
-        self._q_counter = 170  # Phone captures showed IDs starting around q=170.
+        self._q_counter = 170
 
         # Pending futures keyed by request ID — resolved when the mower replies
         self._pending: Dict[int, asyncio.Future] = {}
 
-        # Callback for unsolicited push notifications (live state updates)
+        # Callback for push notifications (live state updates)
         self.on_status_update: Optional[Callable[[Dict[str, Any]], None]] = None
+
+        # Resolved handles — assigned by discover_characteristics() or fallback defaults
+        self._handle_notifications = _DEFAULT_HANDLE_NOTIFICATIONS
+        self._handle_commands_tasks = _DEFAULT_HANDLE_COMMANDS_TASKS
+        self._handle_device_status = _DEFAULT_HANDLE_DEVICE_STATUS
+        self._handle_mpos_positioning = _DEFAULT_HANDLE_MPOS_POSITIONING
+
+    # ------------------------------------------------------------------
+    # Properties (read-only access to resolved handles)
+    # ------------------------------------------------------------------
 
     @property
     def request_id(self) -> int:
@@ -52,8 +58,111 @@ class DreameBLEProtocol:
         self._q_counter += 1
         return current_id
 
+    @property
+    def handle_notifications(self) -> int:
+        return self._handle_notifications
+
+    @property
+    def handle_commands_tasks(self) -> int:
+        return self._handle_commands_tasks
+
+    @property
+    def handle_device_status(self) -> int:
+        return self._handle_device_status
+
+    @property
+    def handle_mpos_positioning(self) -> int:
+        return self._handle_mpos_positioning
+
     # ------------------------------------------------------------------
-    # Binary envelope helpers (C0 … C0)
+    # GATT characteristic discovery
+    # ------------------------------------------------------------------
+
+    async def discover_characteristics(self) -> None:
+        """Discover GATT characteristics by UUID. Falls back to hardcoded handles."""
+        try:
+            services = self._client.services
+            dreame_char_handles = []
+
+            target_uuids = [
+                "0000fee9-0000-1000-8000-00805f9b34fb",
+                "0000fe97-0000-1000-8000-00805f9b34fb",
+            ]
+
+            target_uuid = None  # Track which service UUID we found
+            for uuid in target_uuids:
+                service = None
+                for s in services:
+                    if str(s.uuid) == uuid:
+                        service = s
+                        break
+                if service is not None:
+                    dreame_char_handles = list(service.characteristics)
+                    target_uuid = uuid
+                    break
+
+            if dreame_char_handles and hasattr(dreame_char_handles[-1], 'properties'):
+                notify_handles = []
+                write_handles = []
+                for char in sorted(dreame_char_handles, key=lambda c: c.handle):
+                    props = set(char.properties) if char.properties else set()
+                    is_notify_char = bool(props & {"notify", "indicate"})
+                    is_write_char = bool(props & {"write-with-response", "write"})
+                    if is_notify_char:
+                        notify_handles.append(char.handle)
+                    # Also collect writable characteristics for commands
+                    if is_write_char:
+                        write_handles.append(char.handle)
+
+                _LOGGER.info(
+                    "GATT discovery — service=%s, chars count=%d, notify_count=%d, write count=%d",
+                    target_uuid, len(dreame_char_handles),
+                    len(notify_handles), len(write_handles),
+                )
+                _LOGGER.debug("Notify handles: %s; Write handles: %s",
+                             [hex(h) for h in notify_handles],
+                             [hex(h) for h in write_handles])
+
+                # Map discovered characteristics to our roles
+                if notify_handles:
+                    self._handle_notifications = notify_handles[0]
+                if len(write_handles) >= 3:
+                    # Typical layout (first 3 writable):
+                    # commands/tasks, device_status, mpos_positioning
+                    self._handle_commands_tasks = write_handles[0]
+                    self._handle_device_status = write_handles[1]
+                    self._handle_mpos_positioning = write_handles[-2]
+
+                _LOGGER.info(
+                    "Resolved handles — notifications= 0x%04x, commands=0x%04x, ",
+                    "status=0x%04x, mpos=0x%04x",
+                    self._handle_notifications,
+                    self._handle_commands_tasks,
+                    self._handle_device_status,
+                    self._handle_mpos_positioning,
+                )
+
+            else:
+                _LOGGER.debug(
+                    "Characteristic properties not available in bleak — using known handles"
+                )
+        except Exception as err:
+            _LOGGER.warning(
+                "GATT discovery failed (%s) — falling back to default handles for this firmware.",
+                err,
+            )
+
+        # Sanity-check that all 4 handles have been assigned and log them
+        required = {
+            self._handle_notifications:   "notifications",
+            self._handle_commands_tasks:  "commands/tasks",
+            self._handle_device_status:   "device_status",
+            self._handle_mpos_positioning: "mpos_positioning",
+        }
+        _LOGGER.info("Final characteristic handles: %s", {v: hex(k) for k, v in required.items()})
+
+    # ------------------------------------------------------------------
+    # Binary envelope helpers (C0 . C0)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -72,7 +181,7 @@ class DreameBLEProtocol:
         """Decode a C0 envelope back into its JSON dictionary.
 
         Tries multiple formats because the mower sends different payload types:
-        1. C0 envelope (C0 FF len_hi len_lo json C0 — 4-byte header)
+        1. C0 envelope (C0 FF len_hi len_lo json C0 - 4-byte header)
         2. Bare JSON (plain UTF-8 without any wrapper)
         """
         # --- Format 1: C0 envelope ---
@@ -97,7 +206,7 @@ class DreameBLEProtocol:
 
         # --- Debug dump for unknown formats ---
         _LOGGER.debug(
-            "Unable to decode notification payload (%d bytes), "
+            "Unable to decode notification payload (%d bytes), ",
             "first_byte=0x%02x, last_byte=0x%02x: %s",
             len(raw_bytes),
             raw_bytes[0] if raw_bytes else 0,
@@ -114,13 +223,18 @@ class DreameBLEProtocol:
         """Subscribe to mower push notifications on the notification handle."""
         try:
             await self._client.start_notify(
-                DREAME_HANDLE_NOTIFICATIONS,
+                self.handle_notifications,
                 self._notification_callback,
             )
-            _LOGGER.info("BLE notification subscription active")
+            _LOGGER.info(
+                "BLE notification subscription active on handle 0x%04x",
+                self.handle_notifications,
+            )
             return True
         except Exception as ex:
-            _LOGGER.error("Failed to start BLE notifications: %s", ex)
+            _LOGGER.error(
+                "Failed to start BLE notifications: %s (handle 0x%04x)", ex, self.handle_notifications,
+            )
             return False
 
     def _notification_callback(self, handle: int, data: bytearray):
@@ -217,7 +331,7 @@ class DreameBLEProtocol:
         if extra_data:
             payload["d"] = extra_data
 
-        _LOGGER.debug("Requesting mower state [%s] with Request ID %d (fire-and-forget)", target_type, q_id)
+        _LOGGER.debug("Requesting mower state [%s] with Request ID %d (fire-and-forget)",target_type,q_id)
         # Fire-and-forget — don't block waiting for a matching response
         await self.send_command(handle, payload, wait_for_response=False)
         return {}
@@ -234,7 +348,7 @@ class DreameBLEProtocol:
         }
         _LOGGER.info("Sent mowing command for zone %d (Q=%d)", zone_idx, q_id)
         # Action commands also fire-and-forget — mower pushes state change asynchronously
-        await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd, wait_for_response=False)
+        await self.send_command(self.handle_commands_tasks, cmd, wait_for_response=False)
         return True
 
     async def dock(self) -> bool:
@@ -242,7 +356,7 @@ class DreameBLEProtocol:
         q_id = self.request_id
         cmd = {"m": "a", "p": 0, "o": OP_DOCK_RETURN, "d": {"idx": 0}, "q": q_id}
         _LOGGER.info("Sent dock command (Q=%d)", q_id)
-        await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd, wait_for_response=False)
+        await self.send_command(self.handle_commands_tasks, cmd, wait_for_response=False)
         return True
 
     async def pause(self) -> bool:
@@ -250,5 +364,5 @@ class DreameBLEProtocol:
         q_id = self.request_id
         cmd = {"m": "a", "p": 0, "o": OP_PARK_AT_POS, "q": q_id}
         _LOGGER.info("Sent pause/park command (Q=%d)", q_id)
-        await self.send_command(DREAME_HANDLE_COMMANDS_TASKS, cmd, wait_for_response=False)
+        await self.send_command(self.handle_commands_tasks, cmd, wait_for_response=False)
         return True

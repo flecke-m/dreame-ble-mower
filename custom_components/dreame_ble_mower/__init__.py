@@ -30,22 +30,45 @@ from .protocol import DreameBLEProtocol
 _LOGGER = logging.getLogger(__name__)
 
 
-async def _connect_with_retry(ble_device) -> "BleakClient":  # type: ignore[return-type]  # noqa: F821
-    """Connect to the mower, with bleak_retry_connector or a manual retry loop."""
-    from bleak import BleakClient
+async def _connect_with_pairing(ble_device):  # type: ignore[return-type]  # noqa: F821
+    """Connect to the mower, establish pairing/bonding, then return the client."""
+    from bleak import BleakClient, BleakError
 
     if HAS_RETRY_CONNECTOR:
-        return await establish_connection(
+        client = await establish_connection(
             BleakClient, ble_device, str(ble_device.address), max_attempts=4
         )
+    else:
+        _LOGGER.warning(
+            "bleak_retry_connector unavailable — connecting with bare bleak (no retry)"
+        )
+        client = BleakClient(str(ble_device.address), timeout=15.0)
+        await client.connect()
 
-    # Fallback: manually retry up to 3 times in case the adapter or ESPHome proxy
-    # drops the first attempt.
-    _LOGGER.warning(
-        "bleak_retry_connector unavailable, connecting with bare bleak (no retry)"
-    )
-    client = BleakClient(str(ble_device.address), timeout=15.0)
-    await client.connect()
+    # ------------------------------------------------------------------
+    # BLE Pairing / Bonding  (ROOT CAUSE for "all entities undefined")
+    # ------------------------------------------------------------------
+    # The mower requires authentication before it sends meaningful push
+    # notifications or accepts writes on command characteristics. Without
+    # bonding the connection succeeds at L2CAP level but all entity values
+    # stay undefined because encrypted handles reject unauthenticated traffic.
+    _LOGGER.info("Attempting BLE pairing/bonding for %s …", ble_device.address)
+    try:
+        paired = await client.pair(protection_key_used=True, confirm_used=True)
+        _LOGGER.info("BLE pairing successful — result=%s", paired)
+    except BleakError as err:
+        err_msg = str(err).lower()
+        # Some devices are already bonded from a previous run — that's fine
+        if "already" in err_msg or "paired" in err_msg or "bonded" in err_msg:
+            _LOGGER.info("Device already paired/bonded (OK): %s", err)
+        else:
+            _LOGGER.warning(
+                "BLE pairing returned error (may still work on first connect): %s", err
+            )
+    except Exception as err:
+        # Some bleak versions or backends don't support pair() — continue anyway
+        _LOGGER.debug("pair() not available or unexpected error, continuing: %s", err)
+
     return client
 
 
@@ -62,23 +85,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     try:
-        # Use our retry wrapper — prefers bleak_retry_connector when available,
-        # falls back to bare BleakClient.connect() + manual retries for venv/Container setups.
-        client = await _connect_with_retry(ble_device)
-
+        client = await _connect_with_pairing(ble_device)
     except BleakNotFoundError:
         raise ConfigEntryNotReady(
             f"Dreame Mower at {mac_address} disappeared from BLE scan results"
         )
     except Exception as err:
-        # Catch-all for BLEError, connection failures, timeouts, etc.
         raise ConfigEntryNotReady(
-            f"Failed to connect to Dreame Mower at {mac_address}: {err}"
+            f"Failed to connect + pair to Dreame Mower at {mac_address}: {err}"
         ) from err
 
-    _LOGGER.info("BLE connection established")
+    _LOGGER.info("BLE connection + pairing established for %s", mac_address)
 
     protocol = DreameBLEProtocol(client)
+
+    # Discover GATT characteristics by UUID so we don't depend on hardcoded ATT
+    # handle numbers that shift between firmware versions. Falls back to the
+    # known handles if discovery finds fewer than expected characteristics.
+    await protocol.discover_characteristics()
 
     # Subscribe to mower push notifications BEFORE the first refresh so
     # incoming responses are routed to pending futures.
