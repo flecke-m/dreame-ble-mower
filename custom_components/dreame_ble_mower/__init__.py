@@ -29,10 +29,14 @@ def _resolve_bleak():
     """
     global HAS_RETRY_CONNECTOR  # noqa: PLW0603
     if HAS_RETRY_CONNECTOR is None:
+        BleakNotFoundError = Exception  # fallback stub for type narrowing below
+        establish_connection = None
         try:
-            from bleak_retry_connector import BleakNotFoundError, establish_connection
+            from bleak_retry_connector import (
+                BleakNotFoundError,
+                establish_connection,
+            )
 
-            BleakNotFoundError()  # noqa: B018 – sanity-instantiate to catch broken installs early
             HAS_RETRY_CONNECTOR = True
         except ImportError:
             _LOGGER.warning(
