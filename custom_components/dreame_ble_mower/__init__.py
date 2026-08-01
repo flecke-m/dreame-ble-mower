@@ -49,44 +49,50 @@ def _resolve_bleak():
 
 async def _connect_with_pairing(ble_device):  # type: ignore[return-type]
     """Connect to the mower, establish pairing/bonding, then return the client."""
-    from bleak import BleakClient, BleakError
+    from bleak import BleakError
 
     if HAS_RETRY_CONNECTOR is None:
         _resolve_bleak()
 
     if HAS_RETRY_CONNECTOR:
         _, establish_connection = _resolve_bleak()
+        from bleak_retry_connector import BleakClientWithServiceCache
+
         client = await establish_connection(
-            BleakClient, ble_device, str(ble_device.address), max_attempts=4
+            BleakClientWithServiceCache, ble_device, str(ble_device.address), max_attempts=4
         )
     else:
+        from bleak import BleakClient
+
         _LOGGER.warning("Connecting with bare bleak (no retry)")
         client = BleakClient(str(ble_device.address), timeout=15.0)
         await client.connect()
 
     # ------------------------------------------------------------------
-    # BLE Pairing / Bonding  (ROOT CAUSE for "all entities undefined")
+    # BLE Pairing / Bonding  (Required for entity state population)
     # ------------------------------------------------------------------
     # The mower requires authentication before it sends meaningful push
-    # notifications or accepts writes on command characteristics. Without
-    # bonding the connection succeeds at L2CAP level but all entity values
-    # stay undefined because encrypted handles reject unauthenticated traffic.
+    # notifications. Without bonding the connection succeeds at L2CAP level
+    # but all entity values stay undefined because encrypted handles reject
+    # unauthenticated traffic.
+    #
+    # Based on Husqvarna Automower BLE approach: call pair() without extra
+    # flags and continue even if it fails (some firmwares don't require it).
     _LOGGER.info("Attempting BLE pairing/bonding for %s …", ble_device.address)
     try:
-        paired = await client.pair(protection_key_used=True, confirm_used=True)
-        _LOGGER.info("BLE pairing successful — result=%s", paired)
+        await client.pair()  # Simple call - mower handles its own protocol
+        _LOGGER.info("BLE pairing successful")
     except BleakError as err:
         err_msg = str(err).lower()
-        # Some devices are already bonded from a previous run — that's fine
         if "already" in err_msg or "paired" in err_msg or "bonded" in err_msg:
             _LOGGER.info("Device already paired/bonded (OK): %s", err)
         else:
-            _LOGGER.warning(
-                "BLE pairing returned error (may still work on first connect): %s", err
+            _LOGGER.debug(
+                "Pairing not completed, continuing anyway (mower may not require it): %s",
+                err,
             )
     except Exception as err:
-        # Some bleak versions or backends don't support pair() — continue anyway
-        _LOGGER.debug("pair() not available or unexpected error, continuing: %s", err)
+        _LOGGER.debug("pair() unavailable or unexpected error: %s", err)
 
     return client
 
