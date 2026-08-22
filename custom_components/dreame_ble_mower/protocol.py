@@ -151,6 +151,11 @@ class DreameBLEProtocol:
         self._write_handles: List[int] = []    # every writable char handle
         self._read_handles: List[int] = []     # every readable char handle
         self._notify_handles: List[int] = []   # every notify-capable handle
+        # ATT handle → characteristic object. Bleak client methods expect the
+        # characteristic object (a UUID string), NOT the ATT handle — passing
+        # "0x00NN" makes bleak parse it as a UUID string and raise
+        # "badly formed hexadecimal UUID string".
+        self._char_by_handle: Dict[int, Any] = {}
 
         # Backwards-compat properties (used by coordinator.py currently)
         self.handle_notifications: Optional[int] = None
@@ -201,11 +206,11 @@ class DreameBLEProtocol:
                     best_chars = len(svc.characteristics)
                     target_service = svc
         if target_service is not None:
+            log_min = min((c.handle for c in target_service.characteristics), default=0)
+            log_max = max((c.handle for c in target_service.characteristics), default=0)
             _LOGGER.info(
-                "Dreame GATT service: %s  (handles 0x%02x..0x%02x, %d chars)",
-                target_service.uuid,
-                min(c.handle for c in target_service.characteristics) if target_service.characteristics else 0,
-                max(c.handle for c in target_service.characteristics) if target_service.characteristics else 0,
+                "Dreame GATT service: %s  (handles %s..%s, %d chars)",
+                target_service.uuid, hex(log_min), hex(log_max),
                 len(target_service.characteristics),
             )
 
@@ -218,6 +223,7 @@ class DreameBLEProtocol:
                 "  char 0x%04x  props=%s  writable=%s  readable=%s  notify=%s",
                 char.handle, sorted(props), is_writable, is_readable, is_notify,
             )
+            self._char_by_handle[char.handle] = char
             if is_writable:
                 self._write_handles.append(char.handle)
             if is_readable:
@@ -248,10 +254,11 @@ class DreameBLEProtocol:
         phone app (which subscribes to ALL 8 characteristics)."""
         ok = False
         for h in self._notify_handles:
+            char = self._char_by_handle.get(h)
+            if char is None:
+                continue
             try:
-                await self._client.start_notify(
-                    f"0x{h:04X}", self._on_notify,
-                )
+                await self._client.start_notify(char, self._on_notify)
                 _LOGGER.debug("Subscribed to notifications on 0x%04x", h)
                 ok = True
             except Exception as ex:
@@ -260,7 +267,6 @@ class DreameBLEProtocol:
                 # that's fine; the phone app's success only needs the
                 # actual data characteristic to be subscribed.
                 _LOGGER.debug("Notify sub 0x%04x failed: %s", h, ex)
-        # Also try by-UUID handles (bleak resolves "0x00NN" strings)
         _LOGGER.info("Notify subscription attempted on %d handles", len(self._notify_handles))
         return ok
 
@@ -285,18 +291,22 @@ class DreameBLEProtocol:
     # Core send + read
     # ------------------------------------------------------------------
     async def _send_one(self, handle: int, payload: dict) -> None:
+        char = self._char_by_handle.get(handle)
+        if char is None:
+            raise BleakError(f"No characteristic object for handle 0x{handle:04x}")
         envelope = wrap_envelope(payload)
         _LOGGER.debug(
             "→ 0x%04x  q=%s  %s  (env=%s)",
             handle, payload.get("q"), json.dumps(payload)[:200],
             envelope.hex()[:60] + "…",
         )
-        await self._client.write_gatt_char(
-            f"0x{handle:04X}", envelope, response=True,
-        )
+        await self._client.write_gatt_char(char, envelope, response=True)
 
     async def _read_one(self, handle: int) -> Optional[dict]:
-        raw = await self._client.read_gatt_char(f"0x{handle:04X}")
+        char = self._char_by_handle.get(handle)
+        if char is None:
+            raise BleakError(f"No characteristic object for handle 0x{handle:04x}")
+        raw = await self._client.read_gatt_char(char)
         parsed = unwrap_envelope(bytes(raw))
         if parsed is not None:
             _LOGGER.debug("← 0x%04x  q=%s  %s", handle, parsed.get("q"), json.dumps(parsed)[:200])
