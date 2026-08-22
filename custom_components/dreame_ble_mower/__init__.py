@@ -3,11 +3,6 @@ from __future__ import annotations
 
 import logging
 
-# Defer all heavy third-party imports (bleak, bleak_retry_connector) until they
-# are actually needed inside the async setup function. Importing them here would
-# block HA's main event loop during loader.import_module.
-HAS_RETRY_CONNECTOR = None  # Resolved lazily in _resolve_bleak()
-
 from homeassistant.components.bluetooth import async_ble_device_from_address
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_ADDRESS
@@ -20,31 +15,51 @@ from .protocol import DreameBLEProtocol
 
 _LOGGER = logging.getLogger(__name__)
 
+# Defer all heavy third-party imports (bleak, bleak_retry_connector) until they
+# are actually needed. Resolved lazily, exactly once, by _resolve_bleak().
+HAS_RETRY_CONNECTOR = None  # Resolved lazily in _resolve_bleak()
+
+
+class _BleakNotFoundFallback(Exception):
+    """Local stand-in for bleak_retry_connector.BleakNotFoundError.
+
+    Only meaningful as an exception type; nothing raises it when the real
+    package is missing, so it never shadows genuine connection errors.
+    """
+
+
+_RETRY_NOT_FOUND_ERROR = _BleakNotFoundFallback
+_RETRY_ESTABLISH = None
+
 
 def _resolve_bleak():
-    """Lazily resolve bleak + bleak_retry_connector on first call.
+    """Lazily resolve bleak_retry_connector exactly once; safe to call again.
 
-    This avoids blocking HA's event loop at module-load time while still keeping
-    the try/except fallback logic intact.
+    Avoids blocking HA's event loop at module-load time while still keeping
+    the try/except fallback logic intact. Repeated calls (from both
+    async_setup_entry and _connect) always return bound values.
     """
-    global HAS_RETRY_CONNECTOR  # noqa: PLW0603
-    if HAS_RETRY_CONNECTOR is None:
-        BleakNotFoundError = Exception  # fallback stub for type narrowing below
-        establish_connection = None
-        try:
-            from bleak_retry_connector import (
-                BleakNotFoundError,
-                establish_connection,
-            )
+    global HAS_RETRY_CONNECTOR, _RETRY_NOT_FOUND_ERROR, _RETRY_ESTABLISH
+    if HAS_RETRY_CONNECTOR is not None:
+        return _RETRY_NOT_FOUND_ERROR, _RETRY_ESTABLISH
 
-            HAS_RETRY_CONNECTOR = True
-        except ImportError:
-            _LOGGER.warning(
-                "bleak_retry_connector unavailable — falling back to bare bleak with no retry"
-            )
-            HAS_RETRY_CONNECTOR = False
+    try:
+        from bleak_retry_connector import (
+            BleakNotFoundError,
+            establish_connection,
+        )
+    except ImportError:
+        HAS_RETRY_CONNECTOR = False
+        _LOGGER.warning(
+            "bleak_retry_connector unavailable — falling back to bare bleak "
+            "with no retry"
+        )
+        return _RETRY_NOT_FOUND_ERROR, _RETRY_ESTABLISH
 
-    return BleakNotFoundError, establish_connection
+    HAS_RETRY_CONNECTOR = True
+    _RETRY_NOT_FOUND_ERROR = BleakNotFoundError
+    _RETRY_ESTABLISH = establish_connection
+    return _RETRY_NOT_FOUND_ERROR, _RETRY_ESTABLISH
 
 
 async def _connect(ble_device):  # type: ignore[return-type]
