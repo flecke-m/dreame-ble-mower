@@ -13,19 +13,14 @@ Protocol ground truth (byte-verified from newBLElog.pcap frames 673/803/
     0x0021  its CCCD — subscribed, notifications delivered on 0x001d
     0x0023  auxiliary write (app sends {"t":"TIME"} here first)
     0x001d  data read / notification target ({"m":"r","r":-3} etc.)
-- App request sequence (f803→836):
+- App request sequence (f803→838, newBLElog.pcap):
     1. write 0x0023  (e.g. time sync)
     2. write 0x0020  {"m":"g","t":"CFG","q":1}
-    3. read  0x001d  (transient, r may be -3)
+    3. read  0x001d  (ack only — e.g. {"m":"r","r":-3})
     4. write CCCD 0x0021 = enable notify (01 00)
-    5. read  0x0020  → full response JSON
-  Reads are the primary response path; notifications are auxiliary.
-
-- Envelope (byte-verified, both directions):
-      C0 00 <len:u8 = byte-length of body> <body…> C0
-  Examples from the wire:
-    write f804 : c0 00 19 7b 22 6d 22 3a 22 67 22 … 7d c0   (len 0x19=25)
-    resp  f816 : c0 00 10 7b 22 6d 22 3a 22 72 22 3a 22 … 7d c0 (len 0x10=16)
+    5. read  0x0020  → full response JSON ("q":N,"r":0,"d":{...})
+  THE RESPONSE IS READ BACK FROM THE COMMAND HANDLE 0x0020.  0x001d is an
+  ack/error channel only.
 
 Response code field ("r"):
   0   = OK
@@ -41,7 +36,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from bleak import BleakClient, BleakError
 
-from .const import MOWER_SERVICE_UUID
+from .const import CHAR_HANDLE_COMMAND, MOWER_SERVICE_UUID
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -86,37 +81,41 @@ def wrap_envelope(payload: dict | bytes) -> bytes:
 
 
 def unwrap_envelope(raw: bytes) -> Optional[Dict[str, Any]]:
-    """Decode the mower envelope `C0 00 <len:u8> <body> C0`.
+    """Decode the mower envelope.
 
-    Returns the parsed JSON body, or None if the payload is not a
-    valid JSON envelope (e.g. the 1-byte 0x00 acks seen on notify).
+    Wire frames verified in newBLElog.pcap:
+        c0 00 19 7b 22 6d … 7d c0     request  ({"m":"g","t":"CFG","q":1})
+        c0 00 10 7b 22 6d … 7d c0     0x1d ack ({"m":"r","r":-3})
+        c0 01 84 7b 22 64 … 7d c0     CFG blob ({"d":{"AOP":0,…,"BAT":[15,100,1,…]}})
+
+    The bytes immediately after the leading C0 differ between shapes
+    (00 vs 01 prefix + length field), so we do NOT trust the length-field
+    layout. The body itself is the anchor: it is pure ASCII JSON, so it can
+    never contain a 0xC0 byte, and no JSON key/value here contains 0x7B/0x7D
+    outside the real envelope braces.  Rule: first byte 0xC0, last byte 0xC0,
+    and one complete JSON object between them.
     """
     if not raw:
         return None
-    # Envelope: C0 00 LEN BODY C0
-    if (
-        len(raw) >= 6
-        and raw[0] == 0xC0
-        and raw[1] == 0x00
-        and raw[-1] == 0xC0
-    ):
-        declared = raw[2]
-        if declared == len(raw) - 4:
-            body = raw[3:-1]
-            try:
-                parsed = json.loads(body.decode("utf-8"))
-                if isinstance(parsed, dict):
-                    return parsed
-            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                _LOGGER.debug(
-                    "Envelope length matched but body is not JSON: %s — raw=%s",
-                    e, raw.hex(),
-                )
-                return None
-    _LOGGER.debug(
-        "Non-envelope notification payload: %s", raw.hex()[:96],
-    )
-    return None
+    if raw[0] != 0xC0 or len(raw) < 5 or raw[-1] != 0xC0:
+        _LOGGER.debug("Non-envelope payload: %s", raw.hex()[:96])
+        return None
+    start = raw.find(b"{")
+    end = raw.rfind(b"}")
+    if start <= 0 or end < start or raw[end + 1:] != b"\xC0":
+        _LOGGER.debug(
+            "Envelope-shaped but no clean JSON body: %s", raw.hex()[:96],
+        )
+        return None
+    body = raw[start:end + 1]
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        _LOGGER.debug("Envelope body is not JSON: %s — raw=%s", e, raw.hex()[:96])
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -231,11 +230,20 @@ class DreameBLEProtocol:
             if is_notify:
                 self._notify_handles.append(char.handle)
 
-        # Backwards-compat property slots — coordinator.py still reads these
-        if self._write_handles:
-            self.handle_commands_tasks = self._write_handles[0]
-            self.handle_device_status = self._write_handles[0]
-            self.handle_mpos_positioning = self._write_handles[0]
+        # Backwards-compat property slots — coordinator.py still reads these.
+        # Pin the command channel to the pcap-verified handle 0x0020 (the app
+        # writes every {"m":"g"/"m":"a"} request there, f804/f820/f828). Handle
+        # 0x001d is the ack/error channel only (returns {"m":"r","r":-3}).
+        cmd_handle = (
+            CHAR_HANDLE_COMMAND
+            if CHAR_HANDLE_COMMAND in self._char_by_handle
+            else (self._write_handles[0] if self._write_handles else None)
+        )
+        if cmd_handle is not None:
+            self.handle_commands_tasks = cmd_handle
+            self.handle_device_status = cmd_handle
+            self.handle_mpos_positioning = cmd_handle
+        _LOGGER.info("Command handle pinned to 0x%04x", cmd_handle or 0)
         if self._notify_handles:
             self.handle_notifications = self._notify_handles[0]
 
@@ -380,11 +388,16 @@ class DreameBLEProtocol:
                     raise
 
             # Phase 3: poll reads (mower typically responds on the READABLE
-            # handle with a payload matching our q)
+            # handle with a payload matching our q). The app also reads back
+            # from the *command* handle (0x0020) — include it as a candidate.
+            read_cands: List[int] = list(self._read_handles)
+            cmd_h = self.handle_commands_tasks
+            if cmd_h is not None and cmd_h not in read_cands:
+                read_cands.append(cmd_h)
             any_result: Optional[dict] = None
             q_match: Optional[dict] = None
             last_err = None
-            for h in self._read_handles:
+            for h in read_cands:
                 try:
                     parsed = await self._read_one(h)
                 except BleakError as ex:

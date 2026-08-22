@@ -96,22 +96,22 @@ class DreameBleCoordinator(DataUpdateCoordinator):
                 )
 
         # --- Decode task/activity state ---
+        # Wire capture: {"m":"p","t":"TASK","d":{"exe":true,"o":202,"status":true,
+        # "step":5,"total":9}}  — the op code identifies the action; exe only
+        # says whether the mower is currently executing *something* (e.g. a
+        # pause request in progress still has exe=true, o=202).
         if isinstance(data, dict) and "exe" in data:
-            is_working = data["exe"]
             op_code = data.get("o", 0)
-
             with self._lock:
-                if is_working:
-                    self._state["activity"] = (
-                        "mowing" if op_code == 207 else "mapping"
-                    )
+                if op_code == 207:
+                    self._state["activity"] = "mowing"
                     self._state["mowing_zone"] = data.get("idx", 0)
                 elif op_code in (202, 100):
                     self._state["activity"] = "paused"
                 elif op_code == 200:
-                    self._state["activity"] = (
-                        "returning_to_station_to_charge"
-                    )
+                    self._state["activity"] = "returning_to_station_to_charge"
+                elif data["exe"]:
+                    self._state["activity"] = "mowing"
 
         # Trigger HA entity refresh without blocking the callback thread
         asyncio.run_coroutine_threadsafe(
@@ -132,19 +132,17 @@ class DreameBleCoordinator(DataUpdateCoordinator):
         We return whatever state we've collected from push notifications so far.
         """
         try:
-            # Synchronous GET: write to the command handle, read back the
-            # matching q.  Battery/config arrives in the response (or as a
-            # subsequent push); a 4 s timeout keeps the poll cooperative.
+            # Synchronous GET: write {m:g,t:CFG,q:N} to 0x0020, the mower's
+            # response (r:0, d:{BAT:[…],…}) comes back on the same handle.
+            # There is NO "TASK" read query on the wire (the app never sends
+            # one) — activity is only delivered as TASK push notifications,
+            # which _handle_push already processes. So poll CFG only.
             cfg = await self._protocol.read_status("CFG")
             _LOGGER.debug("CFG response: %s", json.dumps(cfg)[:200])
 
-            task = await self._protocol.read_status("TASK")
-            _LOGGER.debug("TASK response: %s", json.dumps(task)[:200])
-
-            # Feed the parsed responses through the same state machine as pushes
-            for resp in (cfg, task):
-                if resp:
-                    self._handle_push(resp)
+            # Feed the parsed response through the same state machine as pushes
+            if cfg:
+                self._handle_push(cfg)
 
         except Exception as ex:
             _LOGGER.warning("Failed to send status request: %s", ex)
