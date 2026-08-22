@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import timedelta
 from threading import Lock
@@ -131,15 +132,19 @@ class DreameBleCoordinator(DataUpdateCoordinator):
         We return whatever state we've collected from push notifications so far.
         """
         try:
-            # Fire-and-forget GET for battery/config data
-            await self._protocol.read_status(
-                self._protocol.handle_device_status, "CFG"
-            )
+            # Synchronous GET: write to the command handle, read back the
+            # matching q.  Battery/config arrives in the response (or as a
+            # subsequent push); a 4 s timeout keeps the poll cooperative.
+            cfg = await self._protocol.read_status("CFG")
+            _LOGGER.debug("CFG response: %s", json.dumps(cfg)[:200])
 
-            # Fire-and-forget GET for task status
-            await self._protocol.read_status(
-                self._protocol.handle_commands_tasks, "TASK"
-            )
+            task = await self._protocol.read_status("TASK")
+            _LOGGER.debug("TASK response: %s", json.dumps(task)[:200])
+
+            # Feed the parsed responses through the same state machine as pushes
+            for resp in (cfg, task):
+                if resp:
+                    self._handle_push(resp)
 
         except Exception as ex:
             _LOGGER.warning("Failed to send status request: %s", ex)

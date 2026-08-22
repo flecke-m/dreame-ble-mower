@@ -47,8 +47,13 @@ def _resolve_bleak():
     return BleakNotFoundError, establish_connection
 
 
-async def _connect_with_pairing(ble_device):  # type: ignore[return-type]
-    """Connect to the mower, establish pairing/bonding, then return the client."""
+async def _connect(ble_device):  # type: ignore[return-type]
+    """Connect to the mower (pure BLE connect — no pairing, no SMP).
+
+    All four PCAPs and the decompiled app confirm the mower opens
+    unencrypted GATT with zero LE pairing — a previous iteration tried
+    an app-level PIN/bond flow that was an assumption, not evidence.
+    """
     from bleak import BleakError
 
     if HAS_RETRY_CONNECTOR is None:
@@ -68,32 +73,7 @@ async def _connect_with_pairing(ble_device):  # type: ignore[return-type]
         client = BleakClient(str(ble_device.address), timeout=15.0)
         await client.connect()
 
-    # ------------------------------------------------------------------
-    # BLE Pairing / Bonding  (Required for entity state population)
-    # ------------------------------------------------------------------
-    # The mower requires authentication before it sends meaningful push
-    # notifications. Without bonding the connection succeeds at L2CAP level
-    # but all entity values stay undefined because encrypted handles reject
-    # unauthenticated traffic.
-    #
-    # Based on Husqvarna Automower BLE approach: call pair() without extra
-    # flags and continue even if it fails (some firmwares don't require it).
-    _LOGGER.info("Attempting BLE pairing/bonding for %s …", ble_device.address)
-    try:
-        await client.pair()  # Simple call - mower handles its own protocol
-        _LOGGER.info("BLE pairing successful")
-    except BleakError as err:
-        err_msg = str(err).lower()
-        if "already" in err_msg or "paired" in err_msg or "bonded" in err_msg:
-            _LOGGER.info("Device already paired/bonded (OK): %s", err)
-        else:
-            _LOGGER.debug(
-                "Pairing not completed, continuing anyway (mower may not require it): %s",
-                err,
-            )
-    except Exception as err:
-        _LOGGER.debug("pair() unavailable or unexpected error: %s", err)
-
+    _LOGGER.info("BLE GATT client established for %s (no SMP pairing)", ble_device.address)
     return client
 
 
@@ -113,17 +93,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     BleakNotFoundError, _ = _resolve_bleak()
 
     try:
-        client = await _connect_with_pairing(ble_device)
+        client = await _connect(ble_device)
     except BleakNotFoundError:
         raise ConfigEntryNotReady(
             f"Dreame Mower at {mac_address} disappeared from BLE scan results"
         )
     except Exception as err:
         raise ConfigEntryNotReady(
-            f"Failed to connect + pair to Dreame Mower at {mac_address}: {err}"
+            f"Failed to connect to Dreame Mower at {mac_address}: {err}"
         ) from err
 
-    _LOGGER.info("BLE connection + pairing established for %s", mac_address)
+    _LOGGER.info("BLE GATT connection established for %s", mac_address)
 
     protocol = DreameBLEProtocol(client)
 

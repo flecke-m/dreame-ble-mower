@@ -1,368 +1,497 @@
 #!/usr/bin/env python3
-"""Dreame Mower Local BLE Protocol Bridge."""
+"""Dreame Mower Local BLE Protocol Bridge.
+
+Protocol ground truth (byte-verified from newBLElog.pcap frames 673/803/
+804/810/816/836 and dreame-wireshark.pcap; decompiled app cross-checked):
+- The mower advertises ONE 128-bit data service:
+    743345ba-72ea-4343-bd74-4b4c16040000
+  (GATT handles 0x0014..0x003a per Read By Group Type Response, f673.)
+- Zero SMP / LTK / bonding frames in ANY capture. No pairing, no PIN —
+  the phone connects and immediately does unencrypted GATT R/W.
+- Handles confirmed on the wire:
+    0x0020  command write (write-with-response, "m":"g"/"m":"a" frames)
+    0x0021  its CCCD — subscribed, notifications delivered on 0x001d
+    0x0023  auxiliary write (app sends {"t":"TIME"} here first)
+    0x001d  data read / notification target ({"m":"r","r":-3} etc.)
+- App request sequence (f803→836):
+    1. write 0x0023  (e.g. time sync)
+    2. write 0x0020  {"m":"g","t":"CFG","q":1}
+    3. read  0x001d  (transient, r may be -3)
+    4. write CCCD 0x0021 = enable notify (01 00)
+    5. read  0x0020  → full response JSON
+  Reads are the primary response path; notifications are auxiliary.
+
+- Envelope (byte-verified, both directions):
+      C0 00 <len:u8 = byte-length of body> <body…> C0
+  Examples from the wire:
+    write f804 : c0 00 19 7b 22 6d 22 3a 22 67 22 … 7d c0   (len 0x19=25)
+    resp  f816 : c0 00 10 7b 22 6d 22 3a 22 72 22 3a 22 … 7d c0 (len 0x10=16)
+
+Response code field ("r"):
+  0   = OK
+  -3  = error (mower-side fault; e.g. zone not ready, auth, in-transit)
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import struct
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from bleak import BleakClient, BleakError
+
+from .const import MOWER_SERVICE_UUID
 
 _LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Default ATT handles (fallback when GATT discovery doesn't find them).
-# These were captured from your PCAP analysis on your firmware revision.
+# Op codes observed in captures (mower→app command vocabulary).
+# Not every op is documented; we use what we saw in successful app sessions.
 # ---------------------------------------------------------------------------
-_DEFAULT_HANDLE_NOTIFICATIONS = 0x0017
-_DEFAULT_HANDLE_COMMANDS_TASKS = 0x001d
-_DEFAULT_HANDLE_DEVICE_STATUS = 0x0023
-_DEFAULT_HANDLE_MPOS_POSITIONING = 0x0029
-
-OP_START_MOWING = 207
-OP_PARK_AT_POS = 202
-OP_DOCK_RETURN = 200
-OP_RESUME_CONTROL = 5
+OP_START_MOWING   = 207   # "a", "p":0, "o":207, "d":{"idx":zone}
+OP_DOCK           = 200   # "a", "p":0, "o":200, "d":{"idx":0}
+OP_PARK           = 202   # "a", "p":0, "o":202
+OP_GET_STATUS     = -1    # use GET on "CFG" / "TASK" targets instead
 REQUEST_TIMEOUT_SEC = 5.0
+HEARTBEAT_HANDLE  = 0x0017  # 1 Hz notify channel, ignore its payload
 
+
+# ---------------------------------------------------------------------------
+# Envelope helpers  (C0 00 00 <len16LE-of-body-included> <json> C0)
+# ---------------------------------------------------------------------------
+
+def wrap_envelope(payload: dict | bytes) -> bytes:
+    """Encode into the mower envelope.
+
+    Layout (byte-verified against wire frames f803/f804/f810 in
+    newBLElog.pcap, both request and response direction):
+        C0 00 <len:u8> <body bytes> C0
+    where len is the *exact* byte count of the body (does NOT include
+    the header or the trailing C0). Verified examples:
+        body = 25 B JSON  →  c0 00 19 <25 B json> c0   (f804)
+        body = 40 B JSON  →  c0 00 28 <40 B json> c0   (f810)
+        body = 16 B JSON  →  c0 00 10 <16 B json> c0   (f816)
+    """
+    if isinstance(payload, (dict, list)):
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    else:
+        body = bytes(payload)
+    if len(body) > 254:
+        raise ValueError(
+            f"Dreame envelope body is {len(body)} bytes — max is 254 "
+            "(1-byte length field)"
+        )
+    return b"\xC0\x00" + bytes([len(body)]) + body + b"\xC0"
+
+
+def unwrap_envelope(raw: bytes) -> Optional[Dict[str, Any]]:
+    """Decode the mower envelope `C0 00 <len:u8> <body> C0`.
+
+    Returns the parsed JSON body, or None if the payload is not a
+    valid JSON envelope (e.g. the 1-byte 0x00 acks seen on notify).
+    """
+    if not raw:
+        return None
+    # Envelope: C0 00 LEN BODY C0
+    if (
+        len(raw) >= 6
+        and raw[0] == 0xC0
+        and raw[1] == 0x00
+        and raw[-1] == 0xC0
+    ):
+        declared = raw[2]
+        if declared == len(raw) - 4:
+            body = raw[3:-1]
+            try:
+                parsed = json.loads(body.decode("utf-8"))
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                _LOGGER.debug(
+                    "Envelope length matched but body is not JSON: %s — raw=%s",
+                    e, raw.hex(),
+                )
+                return None
+    _LOGGER.debug(
+        "Non-envelope notification payload: %s", raw.hex()[:96],
+    )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Protocol class
+# ---------------------------------------------------------------------------
 
 class DreameBLEProtocol:
-    """Low-level BLE wrapper for Dreame mower commands."""
+    """High-level Dreame mower protocol over bleak.
+
+    Usage:
+        protocol = DreameBLEProtocol(client)
+        await protocol.discover_characteristics()
+        await protocol.start_notifications()
+
+        # GET config (battery, TZ, ...):
+        cfg = await protocol.read_config()
+
+        # Actions:
+        ok = await protocol.start_mowing(zone=1)
+        ok = await protocol.dock()
+        ok = await protocol.park()
+    """
 
     def __init__(self, client: BleakClient):
         self._client = client
-        self._q_counter = 170
+        self._q_counter = 0  # app starts its q-counter at 1 after +1
 
-        # Pending futures keyed by request ID — resolved when the mower replies
-        self._pending: Dict[int, asyncio.Future] = {}
+        # Pending futures keyed by (q, expect_read_handle)
+        self._pending: Dict[object, asyncio.Future] = {}
 
-        # Callback for push notifications (live state updates)
-        self.on_status_update: Optional[Callable[[Dict[str, Any]], None]] = None
+        # Discovered handles — populated by discover_characteristics()
+        self._write_handles: List[int] = []    # every writable char handle
+        self._read_handles: List[int] = []     # every readable char handle
+        self._notify_handles: List[int] = []   # every notify-capable handle
 
-        # Resolved handles — assigned by discover_characteristics() or fallback defaults
-        self._handle_notifications = _DEFAULT_HANDLE_NOTIFICATIONS
-        self._handle_commands_tasks = _DEFAULT_HANDLE_COMMANDS_TASKS
-        self._handle_device_status = _DEFAULT_HANDLE_DEVICE_STATUS
-        self._handle_mpos_positioning = _DEFAULT_HANDLE_MPOS_POSITIONING
+        # Backwards-compat properties (used by coordinator.py currently)
+        self.handle_notifications: Optional[int] = None
+        self.handle_commands_tasks: Optional[int] = None
+        self.handle_device_status: Optional[int] = None
+        self.handle_mpos_positioning: Optional[int] = None
+
+        self.on_status_update: Optional[Callable[[dict], None]] = None
 
     # ------------------------------------------------------------------
-    # Properties (read-only access to resolved handles)
+    # Request ID
     # ------------------------------------------------------------------
-
-    @property
-    def request_id(self) -> int:
-        """Get the next auto-incrementing request ID and increment counter."""
-        current_id = self._q_counter
+    def next_q(self) -> int:
         self._q_counter += 1
-        return current_id
-
-    @property
-    def handle_notifications(self) -> int:
-        return self._handle_notifications
-
-    @property
-    def handle_commands_tasks(self) -> int:
-        return self._handle_commands_tasks
-
-    @property
-    def handle_device_status(self) -> int:
-        return self._handle_device_status
-
-    @property
-    def handle_mpos_positioning(self) -> int:
-        return self._handle_mpos_positioning
+        return self._q_counter
 
     # ------------------------------------------------------------------
-    # GATT characteristic discovery
+    # Discovery
     # ------------------------------------------------------------------
-
     async def discover_characteristics(self) -> None:
-        """Discover GATT characteristics by UUID. Falls back to hardcoded handles."""
-        try:
-            services = self._client.services
-            dreame_char_handles = []
-
-            target_uuids = [
-                "0000fee9-0000-1000-8000-00805f9b34fb",
-                "0000fe97-0000-1000-8000-00805f9b34fb",
-            ]
-
-            target_uuid = None  # Track which service UUID we found
-            for uuid in target_uuids:
-                service = None
-                for s in services:
-                    if str(s.uuid) == uuid:
-                        service = s
-                        break
-                if service is not None:
-                    dreame_char_handles = list(service.characteristics)
-                    target_uuid = uuid
-                    break
-
-            if dreame_char_handles and hasattr(dreame_char_handles[-1], 'properties'):
-                notify_handles = []
-                write_handles = []
-                for char in sorted(dreame_char_handles, key=lambda c: c.handle):
-                    props = set(char.properties) if char.properties else set()
-                    is_notify_char = bool(props & {"notify", "indicate"})
-                    is_write_char = bool(props & {"write-with-response", "write"})
-                    if is_notify_char:
-                        notify_handles.append(char.handle)
-                    # Also collect writable characteristics for commands
-                    if is_write_char:
-                        write_handles.append(char.handle)
-
-                _LOGGER.info(
-                    "GATT discovery — service=%s, chars count=%d, notify_count=%d, write count=%d",
-                    target_uuid, len(dreame_char_handles),
-                    len(notify_handles), len(write_handles),
-                )
-                _LOGGER.debug("Notify handles: %s; Write handles: %s",
-                             [hex(h) for h in notify_handles],
-                             [hex(h) for h in write_handles])
-
-                # Map discovered characteristics to our roles
-                if notify_handles:
-                    self._handle_notifications = notify_handles[0]
-                if len(write_handles) >= 3:
-                    # Typical layout (first 3 writable):
-                    # commands/tasks, device_status, mpos_positioning
-                    self._handle_commands_tasks = write_handles[0]
-                    self._handle_device_status = write_handles[1]
-                    self._handle_mpos_positioning = write_handles[-2]
-
-                _LOGGER.info(
-                    "Resolved handles — notifications= 0x%04x, commands=0x%04x, ",
-                    "status=0x%04x, mpos=0x%04x",
-                    self._handle_notifications,
-                    self._handle_commands_tasks,
-                    self._handle_device_status,
-                    self._handle_mpos_positioning,
-                )
-
-            else:
-                _LOGGER.debug(
-                    "Characteristic properties not available in bleak — using known handles"
-                )
-        except Exception as err:
-            _LOGGER.warning(
-                "GATT discovery failed (%s) — falling back to default handles for this firmware.",
-                err,
-            )
-
-        # Sanity-check that all 4 handles have been assigned and log them
-        required = {
-            self._handle_notifications:   "notifications",
-            self._handle_commands_tasks:  "commands/tasks",
-            self._handle_device_status:   "device_status",
-            self._handle_mpos_positioning: "mpos_positioning",
-        }
-        _LOGGER.info("Final characteristic handles: %s", {v: hex(k) for k, v in required.items()})
-
-    # ------------------------------------------------------------------
-    # Binary envelope helpers (C0 . C0)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def wrap(json_data: dict) -> bytes:
-        """Encode a dictionary into the Dreame C0 envelope binary frame.
-
-        Layout: 0xC0 0xFF [len_hi] [len_lo] json_utf8_bytes 0xC0
-        Total header = 4 bytes, trailer = 1 byte.
-        """
-        json_bytes = json.dumps(json_data).encode("utf-8")
-        length_bytes = struct.pack(">H", len(json_bytes))
-        return b"\xC0\xFF" + length_bytes + json_bytes + b"\xC0"
-
-    @staticmethod
-    def unwrap(raw_bytes: bytes) -> Optional[Dict[str, Any]]:
-        """Decode a C0 envelope back into its JSON dictionary.
-
-        Tries multiple formats because the mower sends different payload types:
-        1. C0 envelope (C0 FF len_hi len_lo json C0 - 4-byte header)
-        2. Bare JSON (plain UTF-8 without any wrapper)
-        """
-        # --- Format 1: C0 envelope ---
-        if (len(raw_bytes) >= 6 and
-                raw_bytes[0] == 0xC0 and
-                raw_bytes[-1] == 0xC0):
-            try:
-                # 4-byte header: 0xC0 0xFF len_hi len_lo
-                json_text = raw_bytes[4:-1].decode("utf-8", errors="ignore")
-                return json.loads(json_text)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                pass
-
-        # --- Format 2: Bare JSON (no C0 wrapper) ---
-        try:
-            json_text = raw_bytes.decode("utf-8", errors="ignore").strip()
-            data = json.loads(json_text)
-            if isinstance(data, dict):
-                return data
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
-        # --- Debug dump for unknown formats ---
-        _LOGGER.debug(
-            "Unable to decode notification payload (%d bytes), ",
-            "first_byte=0x%02x, last_byte=0x%02x: %s",
-            len(raw_bytes),
-            raw_bytes[0] if raw_bytes else 0,
-            raw_bytes[-1] if raw_bytes else 0,
-            raw_bytes[:80].hex(),
-        )
-        return None
-
-    # ------------------------------------------------------------------
-    # Notification subscription
-    # ------------------------------------------------------------------
-
-    async def start_notifications(self) -> bool:
-        """Subscribe to mower push notifications on the notification handle."""
-        try:
-            await self._client.start_notify(
-                self.handle_notifications,
-                self._notification_callback,
-            )
+        """Find all writable/readable/notify characteristics in the mower's
+        custom GATT service. We treat every writable char as a valid command
+        target and every readable char as a valid data source (matches what
+        the official app does on every frame we've captured)."""
+        services = self._client.services
+        # Strategy: prefer the largest non-BASE service that is NOT the
+        # 16-bit standard services (GAP 0x1800 / GATT 0x1801 / Dev Info 0x180A)
+        # and has at least one characteristic that is BOTH writable and has
+        # multiple characteristics (mower service shape).
+        # Anchor discovery to the verified mower service UUID first (from pcap
+        # frame 673: 743345ba-72ea-4343-bd74-4b4c16040000). Fall back to the
+        # largest non-base GATT service if that UUID isn't present (BLE stack
+        # may normalise it).
+        uuid_target = MOWER_SERVICE_UUID.replace("-", "").lower()
+        target_service = None
+        for svc in services:
+            if str(svc.uuid).replace("-", "").lower() == uuid_target:
+                target_service = svc
+                break
+        if target_service is None:
+            base16s = {"1800", "1801", "180a", "180c", "180f", "1812"}
+            best_chars = 0
+            for svc in services:
+                short = str(svc.uuid).split("-")[0].lower()
+                if short in base16s:
+                    continue
+                if len(svc.characteristics) > best_chars:
+                    best_chars = len(svc.characteristics)
+                    target_service = svc
+        if target_service is not None:
             _LOGGER.info(
-                "BLE notification subscription active on handle 0x%04x",
-                self.handle_notifications,
+                "Dreame GATT service: %s  (handles 0x%02x..0x%02x, %d chars)",
+                target_service.uuid,
+                min(c.handle for c in target_service.characteristics) if target_service.characteristics else 0,
+                max(c.handle for c in target_service.characteristics) if target_service.characteristics else 0,
+                len(target_service.characteristics),
             )
-            return True
-        except Exception as ex:
-            _LOGGER.error(
-                "Failed to start BLE notifications: %s (handle 0x%04x)", ex, self.handle_notifications,
+
+        for char in (target_service.characteristics if target_service else []):
+            props = set(char.properties or ())
+            is_writable = any(p in props for p in ("write", "write-with-response"))
+            is_readable = "read" in props
+            is_notify = any(p in props for p in ("notify", "indicate"))
+            _LOGGER.debug(
+                "  char 0x%04x  props=%s  writable=%s  readable=%s  notify=%s",
+                char.handle, sorted(props), is_writable, is_readable, is_notify,
             )
-            return False
+            if is_writable:
+                self._write_handles.append(char.handle)
+            if is_readable:
+                self._read_handles.append(char.handle)
+            if is_notify:
+                self._notify_handles.append(char.handle)
 
-    def _notification_callback(self, handle: int, data: bytearray):
-        """Handle incoming notification from the mower."""
-        parsed = self.unwrap(bytes(data))
-        if parsed is None:
-            return  # Already logged in unwrap()
+        # Backwards-compat property slots — coordinator.py still reads these
+        if self._write_handles:
+            self.handle_commands_tasks = self._write_handles[0]
+            self.handle_device_status = self._write_handles[0]
+            self.handle_mpos_positioning = self._write_handles[0]
+        if self._notify_handles:
+            self.handle_notifications = self._notify_handles[0]
 
-        q_id = parsed.get("q")
-        msg_type = parsed.get("m")
-        _LOGGER.debug(
-            "Notification — handle=0x%04x, q=%s, m=%s: %s",
-            handle,
-            q_id,
-            msg_type,
-            str(parsed)[:200],
+        _LOGGER.info(
+            "Resolved handles — write=%s  read=%s  notify=%s",
+            [hex(h) for h in self._write_handles],
+            [hex(h) for h in self._read_handles],
+            [hex(h) for h in self._notify_handles],
         )
 
-        if q_id is not None and q_id in self._pending:
-            # This is a response to one of our pending requests
-            fut = self._pending.pop(q_id)
-            if not fut.done():
+    # ------------------------------------------------------------------
+    # Notify subscription
+    # ------------------------------------------------------------------
+    async def start_notifications(self) -> bool:
+        """Subscribe to every notify-capable characteristic, mirroring the
+        phone app (which subscribes to ALL 8 characteristics)."""
+        ok = False
+        for h in self._notify_handles:
+            try:
+                await self._client.start_notify(
+                    f"0x{h:04X}", self._on_notify,
+                )
+                _LOGGER.debug("Subscribed to notifications on 0x%04x", h)
+                ok = True
+            except Exception as ex:
+                # Some characteristics' CCCD write may fail with
+                # "Attribute is not valid for notify" on older firmware —
+                # that's fine; the phone app's success only needs the
+                # actual data characteristic to be subscribed.
+                _LOGGER.debug("Notify sub 0x%04x failed: %s", h, ex)
+        # Also try by-UUID handles (bleak resolves "0x00NN" strings)
+        _LOGGER.info("Notify subscription attempted on %d handles", len(self._notify_handles))
+        return ok
+
+    def _on_notify(self, _char: str, data: bytearray) -> None:
+        """Incoming notification from the mower."""
+        parsed = unwrap_envelope(bytes(data))
+        if parsed is None:
+            return
+
+        q = parsed.get("q")
+        msg = parsed.get("m")
+        _LOGGER.debug("NOTIFY q=%s m=%s %s", q, msg, json.dumps(parsed)[:220])
+
+        if q is not None and (q in self._pending):
+            fut = self._pending.get(q)
+            if fut and not fut.done():
                 fut.set_result(parsed)
-        else:
-            # Unsolicited push notification → fire live update callback
-            if self.on_status_update:
-                self.on_status_update(parsed)
+        elif self.on_status_update is not None:
+            self.on_status_update(parsed)
 
     # ------------------------------------------------------------------
-    # Send + correlate
+    # Core send + read
     # ------------------------------------------------------------------
+    async def _send_one(self, handle: int, payload: dict) -> None:
+        envelope = wrap_envelope(payload)
+        _LOGGER.debug(
+            "→ 0x%04x  q=%s  %s  (env=%s)",
+            handle, payload.get("q"), json.dumps(payload)[:200],
+            envelope.hex()[:60] + "…",
+        )
+        await self._client.write_gatt_char(
+            f"0x{handle:04X}", envelope, response=True,
+        )
 
-    async def send_command(
-        self, handle: int, payload: dict, wait_for_response: bool = True
-    ) -> Optional[Dict[str, Any]]:
-        """Send a JSON command to a specific GATT handle and optionally wait for a response."""
-        q_id = payload.get("q")
+    async def _read_one(self, handle: int) -> Optional[dict]:
+        raw = await self._client.read_gatt_char(f"0x{handle:04X}")
+        parsed = unwrap_envelope(bytes(raw))
+        if parsed is not None:
+            _LOGGER.debug("← 0x%04x  q=%s  %s", handle, parsed.get("q"), json.dumps(parsed)[:200])
+        return parsed
 
-        # Set up future if we want to wait for the mower's reply
+    async def send_request(
+        self,
+        payload: dict,
+        prefer_write: Optional[int] = None,
+        timeout: float = REQUEST_TIMEOUT_SEC,
+    ) -> dict:
+        """Send a command to the mower and wait for its response.
+
+        The app flow (per captures):
+          1. Write envelope(json with q=N) to a writable handle.
+          2. Read from a readable handle to pull the response with q=N.
+
+        We try each writable handle in order; if a write fails we move on.
+        Then we try each readable handle in order for a response whose q
+        matches. We also check for an in-flight notify that already
+        delivered the response.
+
+        Return: parsed response dict; raises on timeout / all-failed.
+        """
+        q = payload.get("q")
+        loop = asyncio.get_event_loop()
         fut: Optional[asyncio.Future] = None
-        if wait_for_response and q_id is not None:
-            loop = asyncio.get_event_loop_policy().get_event_loop()
+        if q is not None:
             fut = loop.create_future()
-            self._pending[q_id] = fut
+            self._pending[q] = fut
 
         try:
-            wrapped = self.wrap(payload)
-            _LOGGER.debug(
-                "Sending to handle 0x%04x (q=%s): %s",
-                handle,
-                q_id,
-                str(payload)[:200],
+            # Phase 1: send
+            candidates: List[int] = (
+                [prefer_write, *self._write_handles] if prefer_write is not None
+                else list(self._write_handles)
             )
-            await self._client.write_gatt_char(handle, wrapped, response=True)
+            if not candidates:
+                raise BleakError("No writable characteristic discovered")
+            sent = False
+            last_err: Optional[BaseException] = None
+            for h in dict.fromkeys(candidates):  # dedupe, keep order
+                if fut is not None and fut.done():
+                    break
+                try:
+                    await self._send_one(h, payload)
+                    sent = True
+                    break
+                except BleakError as ex:
+                    last_err = ex
+                    _LOGGER.warning(
+                        "Write to 0x%04x failed: %s — trying next handle",
+                        h, ex,
+                    )
+            if not sent and fut is not None and fut.done():
+                pass  # notify raced ahead
+            elif not sent:
+                if fut is not None:
+                    self._pending.pop(q, None)
+                if last_err is not None:
+                    raise last_err
+                raise BleakError("No writable handle accepted the command")
 
-        except Exception as ex:
-            _LOGGER.error("Failed to send BLE command to handle 0x%04x: %s", handle, ex)
-            if fut and q_id is not None:
-                self._pending.pop(q_id, None)
-                if not fut.done():
-                    fut.set_exception(ex)
-            return None
+            # Phase 2: try notify-race first (some responses come in-flight)
+            if fut is not None:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(fut), timeout=0.5)
+                except (asyncio.TimeoutError, asyncio.InvalidStateError):
+                    pass
+                except Exception:
+                    raise
 
-        # Wait for the mower to reply with matching q-id
-        if fut:
-            try:
-                response = await asyncio.wait_for(fut, timeout=REQUEST_TIMEOUT_SEC)
-                _LOGGER.debug("Got matched response for q=%d", q_id)
-                return response
-            except asyncio.TimeoutError:
-                _LOGGER.debug(
-                    "No synchronous reply to q=%d — mower may use async push instead",
-                    q_id,
-                )
-                self._pending.pop(q_id, None)
+            # Phase 3: poll reads (mower typically responds on the READABLE
+            # handle with a payload matching our q)
+            any_result: Optional[dict] = None
+            q_match: Optional[dict] = None
+            last_err = None
+            for h in self._read_handles:
+                try:
+                    parsed = await self._read_one(h)
+                except BleakError as ex:
+                    last_err = ex
+                    continue
+                except Exception as ex:
+                    last_err = ex
+                    continue
+                if parsed is None:
+                    continue
+                if q is not None:
+                    if parsed.get("q") == q:
+                        return parsed
+                else:
+                    return parsed
+                any_result = parsed
+            if fut is not None:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+                except (asyncio.TimeoutError, asyncio.InvalidStateError):
+                    pass
+            if q_match is not None:
+                return q_match
+            if any_result is not None:
+                return any_result
+            if last_err is not None:
+                raise last_err
+            _LOGGER.debug("no readable handle replied for q=%s", q)
+            return {}
 
-        return None
+        finally:
+            if fut is not None and not fut.done():
+                self._pending.pop(q, None)
+                if not fut.cancelled():
+                    fut.cancel()
 
     # ------------------------------------------------------------------
-    # High-level convenience methods
+    # High-level API
     # ------------------------------------------------------------------
+    async def read_status(self, target: str) -> dict:
+        """Generic GET request: m=g, t=<target> ('CFG', 'TASK', 'PREI'…).
 
-    async def read_status(
-        self, handle: int, target_type: str, extra_data: Optional[dict] = None
-    ) -> Dict[str, Any]:
-        """Request specific state from the mower (e.g., Battery, Position).
-
-        NOTE: The mower may not send a synchronous response to GET requests.
-        Instead it pushes state updates through the notification handle.
-        This method sends fire-and-forget — actual data arrives via on_status_update.
+        Writes the request to the preferred command handle, then polls
+        readable handles for the response with the matching q.
+        Returns the full parsed dict, or {} on timeout.
         """
-        q_id = self.request_id
-        payload = {"m": "g", "t": target_type, "q": q_id}
-        if extra_data:
-            payload["d"] = extra_data
+        q = self.next_q()
+        payload = {"m": "g", "t": target, "q": q}
+        return await self.send_request(
+            payload, prefer_write=self.handle_commands_tasks
+        )
 
-        _LOGGER.debug("Requesting mower state [%s] with Request ID %d (fire-and-forget)",target_type,q_id)
-        # Fire-and-forget — don't block waiting for a matching response
-        await self.send_command(handle, payload, wait_for_response=False)
-        return {}
+    async def read_config(self) -> dict:
+        """GET CFG — battery, TZ, VER, LIT etc.  (q=1 in captures)"""
+        return await self.read_status("CFG")
+
+    async def read_prei(self, zone_idx: int = 0) -> dict:
+        """GET PREI — pre-mowing status for a zone."""
+        q = self.next_q()
+        payload = {
+            "m": "g", "t": "PREI",
+            "d": {"idx": zone_idx},
+            "q": q,
+        }
+        return await self.send_request(
+            payload, prefer_write=self.handle_commands_tasks
+        )
+
+    async def ping(self) -> int:
+        """Heartbeat the phone app's `o:207` keepalive? Actually the app
+        writes `{"m":"g","t":"CFG","q":1}` first. Let's just use a read_config."""
+        r = await self.read_config()
+        return int(r.get("r", -1))
 
     async def start_mowing(self, zone_idx: int = 0) -> bool:
-        """Send command to start mowing."""
-        q_id = self.request_id
-        cmd = {
-            "m": "a",
-            "p": 0,
-            "o": OP_START_MOWING,
-            "d": {"idx": zone_idx},
-            "q": q_id,
+        """Send 'start mowing in zone N' command."""
+        q = self.next_q()
+        payload = {
+            "m": "a", "p": 0, "o": OP_START_MOWING,
+            "d": {"idx": zone_idx}, "q": q,
         }
-        _LOGGER.info("Sent mowing command for zone %d (Q=%d)", zone_idx, q_id)
-        # Action commands also fire-and-forget — mower pushes state change asynchronously
-        await self.send_command(self.handle_commands_tasks, cmd, wait_for_response=False)
-        return True
+        _LOGGER.info("Start mowing (zone=%d, q=%d)", zone_idx, q)
+        try:
+            r = await self.send_request(payload)
+        except Exception as ex:
+            _LOGGER.error("start_mowing failed: %s", ex)
+            return False
+        code = int(r.get("r", -1)) if r else -1
+        _LOGGER.info("start_mowing response: r=%d  full=%s", code, json.dumps(r)[:200])
+        return code == 0
 
     async def dock(self) -> bool:
-        """Send command to return to docking station."""
-        q_id = self.request_id
-        cmd = {"m": "a", "p": 0, "o": OP_DOCK_RETURN, "d": {"idx": 0}, "q": q_id}
-        _LOGGER.info("Sent dock command (Q=%d)", q_id)
-        await self.send_command(self.handle_commands_tasks, cmd, wait_for_response=False)
-        return True
+        q = self.next_q()
+        payload = {"m": "a", "p": 0, "o": OP_DOCK, "d": {"idx": 0}, "q": q}
+        _LOGGER.info("Dock (q=%d)", q)
+        try:
+            r = await self.send_request(payload)
+        except Exception as ex:
+            _LOGGER.error("dock failed: %s", ex)
+            return False
+        code = int(r.get("r", -1)) if r else -1
+        _LOGGER.info("dock response: r=%d", code)
+        return code == 0
 
     async def pause(self) -> bool:
-        """Park the mower at its current position."""
-        q_id = self.request_id
-        cmd = {"m": "a", "p": 0, "o": OP_PARK_AT_POS, "q": q_id}
-        _LOGGER.info("Sent pause/park command (Q=%d)", q_id)
-        await self.send_command(self.handle_commands_tasks, cmd, wait_for_response=False)
-        return True
+        """Pause mowing (op 202 — the 'paused' state in the wire state machine)."""
+        return await self.park()
+
+    async def park(self) -> bool:
+        q = self.next_q()
+        payload = {"m": "a", "p": 0, "o": OP_PARK, "q": q}
+        _LOGGER.info("Park (q=%d)", q)
+        try:
+            r = await self.send_request(payload)
+        except Exception as ex:
+            _LOGGER.error("park failed: %s", ex)
+            return False
+        code = int(r.get("r", -1)) if r else -1
+        _LOGGER.info("park response: r=%d", code)
+        return code == 0

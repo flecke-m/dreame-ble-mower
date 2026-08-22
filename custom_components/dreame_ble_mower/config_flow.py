@@ -32,7 +32,8 @@ class DreameBleConfigFlow(ConfigFlow, domain=DOMAIN):
     async def _is_supported(self, discovery_info: BluetoothServiceInfo) -> bool:
         """Check if discovered device looks like a Dreame/MOVA mower.
 
-        The manifest already filters on service_uuid=0xfee9 + connectable=true, but this
+        The manifest already filters on service_uuid=743345ba-72ea-4343-bd74-4b4c16040000
+        + connectable=true (byte-verified from newBLElog.pcap frame 673).
         extra gate reduces false positives from Nordic-chip devices that happen to match.
         Dreame is not a Bluetooth SIG member (Eco-Ware has no company ID), so we cannot
         filter by manufacturer_data — accept the device if its name hints at a mower or

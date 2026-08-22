@@ -34,14 +34,19 @@ class DreameMower(DreameMowerEntity, LawnMowerEntity):
         self._attr_name = "Dreame Mower"
 
     @property
-    def activity(self) -> LawnMowerActivity:
+    def activity(self) -> LawnMowerActivity | None:
+        """Map the coordinator's activity string to HA's lawn_mower activity."""
+        state = self.coordinator.data or {}
+        act = state.get("activity", "no_status")
+        battery_docked = state.get("charging_status") == "docked"
+        fallback = LawnMowerActivity.DOCKED if battery_docked else None
         return {
             "mowing": LawnMowerActivity.MOWING,
             "paused": LawnMowerActivity.PAUSED,
             "error": LawnMowerActivity.ERROR,
             "returning_to_station_to_charge": LawnMowerActivity.RETURNING,
             "docked": LawnMowerActivity.DOCKED,
-        }.get(self._attr_activity, LawnMowerActivity.DOCKED)
+        }.get(act, fallback)
 
     async def async_start_mowing(self) -> None:
         await self.coordinator._protocol.start_mowing(zone_idx=0)

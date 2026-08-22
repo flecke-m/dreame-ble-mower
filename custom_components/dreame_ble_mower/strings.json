@@ -9,10 +9,14 @@
       "bluetooth_confirm": {
         "title": "Confirm Setup",
         "description": "Do you want to set up {name}?"
+      },
+      "reauth_confirm": {
+        "title": "Reconnect to {name}",
+        "description": "Update the MAC address of your Dreame mower."
       }
     },
     "error": {
-      "cannot_connect": "Failed to connect to the mower. Is it in pairing mode and nearby?",
+      "cannot_connect": "Mower not reachable. Is it on, nearby, and in BLE range of your adapter?",
       "already_configured": "This device is already configured.",
       "unknown": "An unknown error occurred."
     },

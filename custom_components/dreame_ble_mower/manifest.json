@@ -2,7 +2,7 @@
   "bluetooth": [
     {
       "connectable": true,
-      "service_uuid": "0000fee9-0000-1000-8000-00805f9b34fb"
+      "service_uuid": "743345ba-72ea-4343-bd74-4b4c16040000"
     }
   ],
   "codeowners": ["@flecke-m"],
