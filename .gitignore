@@ -10,7 +10,11 @@ venv/
 analysis/
 inputs/
 dreame-mower-ble/
+
+# Changelogs — local only, never pushed
 CHANGELOG.md
+CHANGELOG*.md
+change...[truncated]
 
 # OS & IDE
 .DS_Store
